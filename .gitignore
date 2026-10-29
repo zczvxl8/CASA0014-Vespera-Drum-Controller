@@ -1,0 +1,8 @@
+# Arduino secrets
+**/arduino_secrets.h
+
+# macOS files
+.DS_Store
+
+# Build output
+build/
