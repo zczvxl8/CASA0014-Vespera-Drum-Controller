@@ -1,15 +1,22 @@
 // =====================================================
-// CASA0014 - Neon Rainbow Flow
-// Arduino MKR WiFi 1010
+// RHYTHM OF LIGHT
+// Stage 03 - Single Piezo Drum Sensor
 //
-// 72 RGB LEDs
-// Dynamic Rainbow + Neon Waves + Breathing
-// MQTT -> Vespera / Luminaire
+// Arduino MKR WiFi 1010
+// MQTT + Vespera + Neon Rainbow + Piezo Sensor
+//
+// Features:
+// 1. Dynamic neon rainbow animation
+// 2. Real piezo knock detection on A0
+// 3. Knock strength detection
+// 4. Cyan light pulse when struck
+// 5. Smooth light fading
+// 6. Serial Monitor sensor debugging
 // =====================================================
 
 
 // =====================================================
-// 1. Libraries
+// 1. LIBRARIES
 // =====================================================
 
 #include <SPI.h>
@@ -20,230 +27,393 @@
 
 
 // =====================================================
-// 2. WiFi Settings
+// 2. WIFI AND MQTT SETTINGS
 // =====================================================
 
 const char* ssid = SECRET_SSID;
-const char* password = SECRET_PASS;
+const char* wifiPassword = SECRET_PASS;
+
+const char* mqttUser = SECRET_MQTTUSER;
+const char* mqttPassword = SECRET_MQTTPASS;
+
+const char* mqttServer = "mqtt.cetools.org";
+const uint16_t mqttPort = 1884;
+
+
+// Your allocated Vespera light ID
+const char* lightTopic =
+  "student/CASA0014/luminaire/17";
 
 
 // =====================================================
-// 3. MQTT Settings
+// 3. SENSOR SETTINGS
 // =====================================================
 
-const char* mqtt_username = SECRET_MQTTUSER;
-const char* mqtt_password = SECRET_MQTTPASS;
+// First piezo sensor
+const uint8_t piezoPin = A0;
 
-const char* mqtt_server = "mqtt.cetools.org";
-const int mqtt_port = 1884;
+// Sensitivity threshold
+// Lower = more sensitive
+// Higher = less sensitive
+const int hitThreshold = 65;
 
-String lightId = "17";
+// Prevent repeated triggers from one strike
+const unsigned long hitCooldownMs = 130;
 
-String mqtt_topic =
-  "student/CASA0014/luminaire/" + lightId;
+// Time used to capture peak vibration
+const unsigned long captureWindowMs = 15;
 
-// WiFi + MQTT client
+// Light fade duration
+const unsigned long fadeMs = 550;
+
+// LED animation update interval
+const unsigned long frameIntervalMs = 85;
+
+
+// =====================================================
+// 4. VESPERA LED CONFIGURATION
+// =====================================================
+
+const int numLeds = 72;
+
+const int payloadSize = numLeds * 3;
+
+uint8_t rgbPayload[payloadSize];
+
 WiFiClient wifiClient;
+
 PubSubClient mqttClient(wifiClient);
 
-String clientId = "";
+String clientId;
 
 
 // =====================================================
-// 4. LED Settings
+// 5. SENSOR VARIABLES
 // =====================================================
 
-const int num_leds = 72;
+// Resting voltage baseline
+float baseline = 0.0f;
 
-const int payload_size = num_leds * 3;
+// Whether currently collecting a knock peak
+bool collectingHit = false;
 
-byte RGBpayload[payload_size];
+// Knock measurement
+unsigned long captureStartMs = 0;
 
+int capturePeak = 0;
 
-// =====================================================
-// 5. WiFi Connection
-// =====================================================
+// Most recent knock
+unsigned long lastHitMs = 0;
 
-void startWifi() {
-
-  if (WiFi.status() == WL_CONNECTED) {
-    return;
-  }
-
-  static bool attempted = false;
-  static unsigned long lastAttempt = 0;
-
-  unsigned long now = millis();
-
-  if (attempted &&
-      now - lastAttempt < 10000) {
-    return;
-  }
-
-  attempted = true;
-  lastAttempt = now;
-
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(ssid);
-
-  WiFi.begin(ssid, password);
-
-  if (WiFi.status() == WL_CONNECTED) {
-
-    Serial.println("WiFi connected!");
-
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-
-  } else {
-
-    Serial.println("WiFi not connected, will retry...");
-  }
-}
+// Knock brightness intensity
+float hitIntensity = 0.0f;
 
 
 // =====================================================
-// 6. MQTT Connection
+// 6. ANIMATION VARIABLES
 // =====================================================
 
-void reconnectMQTT() {
+uint8_t rainbowPhase = 0;
 
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
+unsigned long lastFrameMs = 0;
 
-  if (mqttClient.connected()) {
-    return;
-  }
+unsigned long lastDebugMs = 0;
 
-  static bool attempted = false;
-  static unsigned long lastAttempt = 0;
+unsigned long lastWifiAttemptMs = 0;
 
-  unsigned long now = millis();
-
-  if (attempted &&
-      now - lastAttempt < 3000) {
-    return;
-  }
-
-  attempted = true;
-  lastAttempt = now;
-
-  Serial.println("Connecting to MQTT...");
-
-  if (mqttClient.connect(
-        clientId.c_str(),
-        mqtt_username,
-        mqtt_password)) {
-
-    Serial.println("MQTT connected!");
-
-  } else {
-
-    Serial.print("MQTT failed, state: ");
-    Serial.println(mqttClient.state());
-  }
-}
+unsigned long lastMqttAttemptMs = 0;
 
 
 // =====================================================
-// 7. Setup
-// =====================================================
-
-void setup() {
-
-  Serial.begin(115200);
-
-  Serial.println();
-  Serial.println("NEON RAINBOW STARTING...");
-
-  byte mac[6];
-
-  WiFi.macAddress(mac);
-
-  char macStr[18];
-
-  snprintf(
-    macStr,
-    sizeof(macStr),
-    "%02X%02X%02X%02X%02X%02X",
-    mac[5], mac[4], mac[3],
-    mac[2], mac[1], mac[0]
-  );
-
-  clientId = "MKR1010_Neon_" + String(macStr);
-
-  Serial.print("Client ID: ");
-  Serial.println(clientId);
-
-  Serial.print("MQTT Topic: ");
-  Serial.println(mqtt_topic);
-
-  mqttClient.setServer(
-    mqtt_server,
-    mqtt_port
-  );
-
-  if (!mqttClient.setBufferSize(512)) {
-    Serial.println("MQTT buffer allocation failed");
-  }
-
-  mqttClient.setKeepAlive(30);
-
-  startWifi();
-
-  Serial.println("Setup complete!");
-}
-
-
-// =====================================================
-// 8. Rainbow Colour Function
+// 7. RAINBOW COLOUR FUNCTION
 // =====================================================
 
 void rainbowRGB(
   uint8_t pos,
-  uint8_t &r,
-  uint8_t &g,
-  uint8_t &b
+  uint8_t& r,
+  uint8_t& g,
+  uint8_t& b
 ) {
 
-  // Red -> Green
   if (pos < 85) {
 
     r = 255 - pos * 3;
+
     g = pos * 3;
+
     b = 0;
 
-  }
-
-  // Green -> Blue
-  else if (pos < 170) {
+  } else if (pos < 170) {
 
     pos -= 85;
 
     r = 0;
+
     g = 255 - pos * 3;
+
     b = pos * 3;
 
-  }
-
-  // Blue -> Red
-  else {
+  } else {
 
     pos -= 170;
 
     r = pos * 3;
+
     g = 0;
+
     b = 255 - pos * 3;
   }
 }
 
 
 // =====================================================
-// 9. Main Neon Rainbow Animation
+// 8. PIEZO SENSOR DETECTION
 // =====================================================
 
-void loop() {
+void samplePiezo(unsigned long now) {
+
+  // Read actual voltage value
+  int raw = analogRead(piezoPin);
+
+  // Calculate difference from resting voltage
+  int delta = abs(raw - (int)baseline);
+
+
+  // -------------------------------------
+  // Slowly update resting voltage
+  // -------------------------------------
+
+  if (!collectingHit && delta < 15) {
+
+    baseline =
+      baseline * 0.995f +
+      raw * 0.005f;
+  }
+
+
+  // -------------------------------------
+  // Capture peak knock strength
+  // -------------------------------------
+
+  if (collectingHit) {
+
+    if (delta > capturePeak) {
+
+      capturePeak = delta;
+    }
+
+
+    // Finish collecting peak
+    if (now - captureStartMs >= captureWindowMs) {
+
+      collectingHit = false;
+
+      lastHitMs = now;
+
+
+      // Convert knock strength to light intensity
+      float scaled =
+        (capturePeak - hitThreshold) / 350.0f;
+
+      hitIntensity = constrain(
+        0.35f + scaled,
+        0.35f,
+        1.0f
+      );
+
+
+      // -------------------------------------
+      // Print actual knock information
+      // -------------------------------------
+
+      Serial.print("Drum 1 HIT! Peak delta: ");
+
+      Serial.print(capturePeak);
+
+      Serial.print(" | Strength: ");
+
+      Serial.println(
+        (int)(hitIntensity * 100.0f)
+      );
+    }
+
+  } else if (
+
+    delta >= hitThreshold &&
+
+    now - lastHitMs >= hitCooldownMs
+
+  ) {
+
+    // Start detecting a new knock
+    collectingHit = true;
+
+    captureStartMs = now;
+
+    capturePeak = delta;
+  }
+
+
+  // -------------------------------------
+  // Print sensor readings every 500 ms
+  // -------------------------------------
+
+  if (now - lastDebugMs >= 500) {
+
+    lastDebugMs = now;
+
+    Serial.print("A0 RAW: ");
+
+    Serial.print(raw);
+
+    Serial.print(" | idle: ");
+
+    Serial.print((int)baseline);
+
+    Serial.print(" | delta: ");
+
+    Serial.println(delta);
+  }
+}
+
+
+// =====================================================
+// 9. NEON RAINBOW + DRUM LIGHT EFFECT
+// =====================================================
+
+void renderNeonFrame(unsigned long now) {
+
+  // Avoid using TWO_PI as a variable name
+  const float neonTau = 6.2831853f;
+
+
+  // -------------------------------------
+  // Breathing light animation
+  // -------------------------------------
+
+  float breathing =
+    0.5f +
+    0.5f * sinf(now * 0.0015f);
+
+
+  // -------------------------------------
+  // Calculate knock flash intensity
+  // -------------------------------------
+
+  float flash = 0.0f;
+
+  unsigned long age = now - lastHitMs;
+
+  if (age < fadeMs) {
+
+    flash =
+      hitIntensity *
+      (1.0f - age / (float)fadeMs);
+  }
+
+
+  // -------------------------------------
+  // Generate colours for all 72 LEDs
+  // -------------------------------------
+
+  for (int pixel = 0; pixel < numLeds; pixel++) {
+
+    // Rainbow position
+    uint8_t hue =
+
+      (pixel * 256 / numLeds +
+       rainbowPhase) & 255;
+
+
+    uint8_t r, g, b;
+
+    rainbowRGB(hue, r, g, b);
+
+
+    // -------------------------------------
+    // Moving neon wave
+    // -------------------------------------
+
+    float wave =
+
+      0.5f +
+
+      0.5f * sinf(
+
+        neonTau *
+        pixel /
+        (float)numLeds *
+        2.0f +
+
+        now * 0.0025f
+      );
+
+
+    // -------------------------------------
+    // Background brightness
+    // -------------------------------------
+
+    float brightness =
+
+      0.28f +
+
+      0.22f * wave +
+
+      0.10f * breathing;
+
+
+    // -------------------------------------
+    // Apply cyan knock flash
+    // -------------------------------------
+
+    rgbPayload[pixel * 3 + 0] =
+
+      (uint8_t)constrain(
+
+        r * brightness +
+        80.0f * flash,
+
+        0.0f,
+        255.0f
+      );
+
+
+    rgbPayload[pixel * 3 + 1] =
+
+      (uint8_t)constrain(
+
+        g * brightness +
+        205.0f * flash,
+
+        0.0f,
+        255.0f
+      );
+
+
+    rgbPayload[pixel * 3 + 2] =
+
+      (uint8_t)constrain(
+
+        b * brightness +
+        255.0f * flash,
+
+        0.0f,
+        255.0f
+      );
+  }
+
+
+  // Move rainbow forward
+  rainbowPhase += 2;
+}
+
+
+// =====================================================
+// 10. WIFI AND MQTT CONNECTION
+// =====================================================
+
+void serviceNetwork(unsigned long now) {
+
 
   // -------------------------------------
   // Check WiFi
@@ -251,7 +421,21 @@ void loop() {
 
   if (WiFi.status() != WL_CONNECTED) {
 
-    startWifi();
+    if (
+
+      now - lastWifiAttemptMs >= 10000UL ||
+
+      lastWifiAttemptMs == 0
+
+    ) {
+
+      lastWifiAttemptMs = now;
+
+      Serial.println("Connecting to WiFi...");
+
+      WiFi.begin(ssid, wifiPassword);
+    }
+
     return;
   }
 
@@ -262,145 +446,219 @@ void loop() {
 
   if (!mqttClient.connected()) {
 
-    reconnectMQTT();
+    if (
+
+      now - lastMqttAttemptMs >= 5000UL ||
+
+      lastMqttAttemptMs == 0
+
+    ) {
+
+      lastMqttAttemptMs = now;
+
+      Serial.println("Connecting to MQTT...");
+
+
+      if (
+
+        mqttClient.connect(
+
+          clientId.c_str(),
+
+          mqttUser,
+
+          mqttPassword
+
+        )
+
+      ) {
+
+        Serial.println("MQTT connected");
+
+      } else {
+
+        Serial.print("MQTT error state: ");
+
+        Serial.println(mqttClient.state());
+      }
+    }
+
     return;
   }
 
+
+  // Keep MQTT connection active
   mqttClient.loop();
+}
 
 
-  // -------------------------------------
-  // Animation Settings
-  // -------------------------------------
+// =====================================================
+// 11. SETUP
+// =====================================================
 
-  static uint8_t phase = 0;
+void setup() {
 
-  const float NEON_TAU = 6.2831853f;
-
-  float timePhase =
-    (float)phase / 256.0f;
+  Serial.begin(115200);
 
 
-  // -------------------------------------
-  // Global Breathing
-  // -------------------------------------
+  // 10-bit analog input
+  analogReadResolution(10);
 
-  float breathing =
-    0.5f +
-    0.5f * sinf(
-      NEON_TAU * timePhase
-    );
+  pinMode(piezoPin, INPUT);
 
 
-  // =====================================
-  // Generate All 72 LED Colours
-  // =====================================
-
-  for (int pixel = 0;
-       pixel < num_leds;
-       pixel++) {
-
-
-    // -----------------------------------
-    // A. Moving Rainbow
-    // -----------------------------------
-
-    uint8_t hue = (uint8_t)(
-      (pixel * 256L / num_leds + phase) & 255
-    );
-
-    uint8_t r, g, b;
-
-    rainbowRGB(hue, r, g, b);
-
-
-    // -----------------------------------
-    // B. Pixel Position
-    // -----------------------------------
-
-    float x =
-      (float)pixel / (float)num_leds;
-
-
-    // -----------------------------------
-    // C. Main Neon Wave
-    // -----------------------------------
-
-    float neonWave =
-      0.5f +
-      0.5f * sinf(
-        NEON_TAU *
-        (2.0f * x - timePhase)
-      );
-
-
-    // -----------------------------------
-    // D. Secondary Light Wave
-    // -----------------------------------
-
-    float shimmer =
-      0.5f +
-      0.5f * sinf(
-        NEON_TAU *
-        (4.0f * x + timePhase)
-      );
-
-
-    // -----------------------------------
-    // E. Combine Brightness
-    // -----------------------------------
-
-    float brightness =
-      0.32f +
-      0.45f * neonWave +
-      0.13f * shimmer +
-      0.10f * breathing;
-
-
-    // -----------------------------------
-    // F. Neon Brightness Limit
-    // -----------------------------------
-
-    uint8_t scale =
-      (uint8_t)(215.0f * brightness);
-
-
-    // -----------------------------------
-    // G. Apply Brightness
-    // -----------------------------------
-
-    RGBpayload[pixel * 3 + 0] =
-      (uint16_t)r * scale / 255;
-
-    RGBpayload[pixel * 3 + 1] =
-      (uint16_t)g * scale / 255;
-
-    RGBpayload[pixel * 3 + 2] =
-      (uint16_t)b * scale / 255;
-  }
-
-
-  // =====================================
-  // 10. Publish to Luminaire
-  // =====================================
-
-  bool success = mqttClient.publish(
-    mqtt_topic.c_str(),
-    RGBpayload,
-    payload_size
+  Serial.println(
+    "Stage 03: Single Piezo + Neon Rainbow"
   );
 
-  if (!success) {
 
-    Serial.println("MQTT publish failed");
+  // -------------------------------------
+  // Calibrate sensor resting value
+  // -------------------------------------
+
+  Serial.println(
+    "Keep the piezo still while calibrating..."
+  );
+
+
+  long total = 0;
+
+  for (int sample = 0; sample < 100; sample++) {
+
+    total += analogRead(piezoPin);
+
+    delay(2);
   }
 
 
-  // =====================================
-  // 11. Animate Rainbow
-  // =====================================
+  baseline = total / 100.0f;
 
-  phase += 2;
 
-  delay(75);
+  Serial.print("Calibrated A0 idle = ");
+
+  Serial.println((int)baseline);
+
+
+  // -------------------------------------
+  // Create unique MQTT client ID
+  // -------------------------------------
+
+  byte mac[6] = {0};
+
+  WiFi.macAddress(mac);
+
+
+  char macText[13];
+
+  snprintf(
+
+    macText,
+
+    sizeof(macText),
+
+    "%02X%02X%02X%02X%02X%02X",
+
+    mac[5],
+
+    mac[4],
+
+    mac[3],
+
+    mac[2],
+
+    mac[1],
+
+    mac[0]
+  );
+
+
+  clientId =
+
+    String("MKR1010_Drum_") +
+
+    macText;
+
+
+  // -------------------------------------
+  // MQTT configuration
+  // -------------------------------------
+
+  mqttClient.setServer(
+
+    mqttServer,
+
+    mqttPort
+  );
+
+
+  mqttClient.setBufferSize(512);
+
+  mqttClient.setKeepAlive(30);
+
+  mqttClient.setSocketTimeout(2);
+
+
+  // Start connection
+  serviceNetwork(millis());
+}
+
+
+// =====================================================
+// 12. MAIN LOOP
+// =====================================================
+
+void loop() {
+
+  unsigned long now = millis();
+
+
+  // -------------------------------------
+  // Step 1: Read real piezo sensor
+  // -------------------------------------
+
+  samplePiezo(now);
+
+
+  // -------------------------------------
+  // Step 2: Maintain network connection
+  // -------------------------------------
+
+  serviceNetwork(now);
+
+
+  // -------------------------------------
+  // Step 3: Update animation
+  // -------------------------------------
+
+  if (now - lastFrameMs >= frameIntervalMs) {
+
+    lastFrameMs = now;
+
+
+    // Create neon rainbow + knock response
+    renderNeonFrame(now);
+
+
+    // -------------------------------------
+    // Step 4: Publish to Vespera
+    // -------------------------------------
+
+    if (mqttClient.connected()) {
+
+      bool success = mqttClient.publish(
+
+        lightTopic,
+
+        rgbPayload,
+
+        payloadSize
+      );
+
+
+      if (!success) {
+
+        Serial.println("MQTT publish failed");
+      }
+    }
+  }
 }
