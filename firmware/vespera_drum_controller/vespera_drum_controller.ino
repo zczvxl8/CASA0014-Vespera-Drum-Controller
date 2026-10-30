@@ -1,17 +1,21 @@
 // =====================================================
 // RHYTHM OF LIGHT
-// Stage 03 - Single Piezo Drum Sensor
+// Stage 05 - Three Piezo Drums
 //
 // Arduino MKR WiFi 1010
-// MQTT + Vespera + Neon Rainbow + Piezo Sensor
+// MQTT + Vespera + 3 Piezo Sensors
+//
+// Drum 1: A0 -> LEDs 0-23
+// Drum 2: A1 -> LEDs 24-47
+// Drum 3: A2 -> LEDs 48-71
 //
 // Features:
-// 1. Dynamic neon rainbow animation
-// 2. Real piezo knock detection on A0
-// 3. Knock strength detection
-// 4. Cyan light pulse when struck
-// 5. Smooth light fading
-// 6. Serial Monitor sensor debugging
+// - Three independent drum sensors
+// - Three neon colour palettes
+// - Different colours for different strengths
+// - Simultaneous hit colour fusion
+// - Smooth colour fading
+// - Animated neon rainbow background
 // =====================================================
 
 
@@ -27,58 +31,83 @@
 
 
 // =====================================================
-// 2. WIFI AND MQTT SETTINGS
+// 2. WIFI AND MQTT
 // =====================================================
 
-const char* ssid = SECRET_SSID;
-const char* wifiPassword = SECRET_PASS;
+const char* WIFI_SSID = SECRET_SSID;
 
-const char* mqttUser = SECRET_MQTTUSER;
-const char* mqttPassword = SECRET_MQTTPASS;
+const char* WIFI_PASSWORD = SECRET_PASS;
 
-const char* mqttServer = "mqtt.cetools.org";
-const uint16_t mqttPort = 1884;
+const char* MQTT_USER = SECRET_MQTTUSER;
+
+const char* MQTT_PASSWORD = SECRET_MQTTPASS;
+
+const char* MQTT_SERVER = "mqtt.cetools.org";
+
+const uint16_t MQTT_PORT = 1884;
 
 
-// Your allocated Vespera light ID
-const char* lightTopic =
+// Your Vespera light ID
+const char* LIGHT_TOPIC =
   "student/CASA0014/luminaire/17";
 
 
 // =====================================================
-// 3. SENSOR SETTINGS
+// 3. THREE DRUM CONFIGURATION
 // =====================================================
 
-// First piezo sensor
-const uint8_t piezoPin = A0;
+const int NUM_DRUMS = 3;
 
-// Sensitivity threshold
-// Lower = more sensitive
-// Higher = less sensitive
-const int hitThreshold = 65;
+const int NUM_LEDS = 72;
 
-// Prevent repeated triggers from one strike
-const unsigned long hitCooldownMs = 130;
+const int LEDS_PER_DRUM = 24;
 
-// Time used to capture peak vibration
-const unsigned long captureWindowMs = 15;
+const int PAYLOAD_SIZE = NUM_LEDS * 3;
+
+
+// Three actual piezo inputs
+const uint8_t PIEZO_PINS[NUM_DRUMS] = {
+
+  A0,
+  A1,
+  A2
+
+};
+
+
+// Each drum has its own sensitivity setting
+const int HIT_THRESHOLD[NUM_DRUMS] = {
+
+  25,   // Drum 1
+  25,   // Drum 2
+  25    // Drum 3
+
+};
+
+
+// Prevent one hit from registering repeatedly
+const unsigned long COOLDOWN_MS = 130;
+
+
+// Time to measure knock peak
+const unsigned long PEAK_WINDOW_MS = 15;
+
+
+// Hits within this window are treated as simultaneous
+const unsigned long FUSION_WINDOW_MS = 130;
+
 
 // Light fade duration
-const unsigned long fadeMs = 550;
+const unsigned long FADE_MS = 480;
 
-// LED animation update interval
-const unsigned long frameIntervalMs = 85;
+
+// Animation update interval
+const unsigned long FRAME_MS = 85;
 
 
 // =====================================================
-// 4. VESPERA LED CONFIGURATION
+// 4. MQTT OBJECTS
 // =====================================================
-
-const int numLeds = 72;
-
-const int payloadSize = numLeds * 3;
-
-uint8_t rgbPayload[payloadSize];
 
 WiFiClient wifiClient;
 
@@ -87,52 +116,188 @@ PubSubClient mqttClient(wifiClient);
 String clientId;
 
 
-// =====================================================
-// 5. SENSOR VARIABLES
-// =====================================================
-
-// Resting voltage baseline
-float baseline = 0.0f;
-
-// Whether currently collecting a knock peak
-bool collectingHit = false;
-
-// Knock measurement
-unsigned long captureStartMs = 0;
-
-int capturePeak = 0;
-
-// Most recent knock
-unsigned long lastHitMs = 0;
-
-// Knock brightness intensity
-float hitIntensity = 0.0f;
+// Array storing the colours of 72 LEDs
+uint8_t rgbPayload[PAYLOAD_SIZE];
 
 
 // =====================================================
-// 6. ANIMATION VARIABLES
+// 5. DRUM SENSOR VARIABLES
+// =====================================================
+
+// Resting voltage of each sensor
+float baseline[NUM_DRUMS] = {
+
+  0, 0, 0
+
+};
+
+
+// Latest analog readings
+int latestRaw[NUM_DRUMS] = {
+
+  0, 0, 0
+
+};
+
+
+// Whether each drum is currently measuring a hit
+bool capturing[NUM_DRUMS] = {
+
+  false, false, false
+
+};
+
+
+// Start time of each hit measurement
+unsigned long captureStart[NUM_DRUMS] = {
+
+  0, 0, 0
+
+};
+
+
+// Peak measurement of each hit
+int capturePeak[NUM_DRUMS] = {
+
+  0, 0, 0
+
+};
+
+
+// Most recent hit time of each drum
+unsigned long lastHit[NUM_DRUMS] = {
+
+  0, 0, 0
+
+};
+
+
+// Strength of each drum: 0.0 to 1.0
+float force[NUM_DRUMS] = {
+
+  0, 0, 0
+
+};
+
+
+// =====================================================
+// 6. COLOUR FUSION VARIABLES
+// =====================================================
+
+// Indicates which drums are in the fusion group
+uint8_t fusionMask = 0;
+
+
+// First hit in the current group
+unsigned long fusionStart = 0;
+
+
+// Latest hit in the group
+unsigned long fusionLastHit = 0;
+
+
+// =====================================================
+// 7. ANIMATION VARIABLES
 // =====================================================
 
 uint8_t rainbowPhase = 0;
 
-unsigned long lastFrameMs = 0;
+unsigned long lastFrame = 0;
 
-unsigned long lastDebugMs = 0;
+unsigned long lastDebug = 0;
 
-unsigned long lastWifiAttemptMs = 0;
+unsigned long lastWifiAttempt = 0;
 
-unsigned long lastMqttAttemptMs = 0;
+unsigned long lastMqttAttempt = 0;
 
 
 // =====================================================
-// 7. RAINBOW COLOUR FUNCTION
+// 8. RGB COLOUR STRUCTURE
+// =====================================================
+
+struct RGB {
+
+  float r;
+  float g;
+  float b;
+
+};
+
+
+// =====================================================
+// 9. THREE DRUM COLOUR PALETTES
+// =====================================================
+
+RGB drumColour(int drum, float strength) {
+
+  strength = constrain(
+    strength,
+    0.0f,
+    1.0f
+  );
+
+
+  // -------------------------------------
+  // Drum 1: Purple -> Neon Pink
+  // -------------------------------------
+
+  if (drum == 0) {
+
+    return {
+
+      170.0f + 85.0f * strength,
+
+      65.0f - 45.0f * strength,
+
+      255.0f - 75.0f * strength
+
+    };
+  }
+
+
+  // -------------------------------------
+  // Drum 2: Cyan -> Mint Green
+  // -------------------------------------
+
+  if (drum == 1) {
+
+    return {
+
+      20.0f + 20.0f * strength,
+
+      175.0f + 80.0f * strength,
+
+      255.0f - 115.0f * strength
+
+    };
+  }
+
+
+  // -------------------------------------
+  // Drum 3: Gold -> Orange Red
+  // -------------------------------------
+
+  return {
+
+    255.0f,
+
+    175.0f - 120.0f * strength,
+
+    45.0f - 25.0f * strength
+
+  };
+}
+
+
+// =====================================================
+// 10. RAINBOW COLOUR FUNCTION
 // =====================================================
 
 void rainbowRGB(
   uint8_t pos,
-  uint8_t& r,
-  uint8_t& g,
-  uint8_t& b
+  uint8_t &r,
+  uint8_t &g,
+  uint8_t &b
 ) {
 
   if (pos < 85) {
@@ -167,273 +332,582 @@ void rainbowRGB(
 
 
 // =====================================================
-// 8. PIEZO SENSOR DETECTION
+// 11. COUNT HOW MANY DRUMS ARE IN A GROUP
 // =====================================================
 
-void samplePiezo(unsigned long now) {
+int countDrums(uint8_t mask) {
 
-  // Read actual voltage value
-  int raw = analogRead(piezoPin);
+  int result = 0;
 
-  // Calculate difference from resting voltage
-  int delta = abs(raw - (int)baseline);
+  for (int i = 0; i < NUM_DRUMS; i++) {
 
+    if (mask & (1 << i)) {
 
-  // -------------------------------------
-  // Slowly update resting voltage
-  // -------------------------------------
-
-  if (!collectingHit && delta < 15) {
-
-    baseline =
-      baseline * 0.995f +
-      raw * 0.005f;
+      result++;
+    }
   }
 
+  return result;
+}
+
+
+// =====================================================
+// 12. REGISTER A DRUM HIT
+// =====================================================
+
+void registerHit(
+  int drum,
+  int peak,
+  unsigned long now
+) {
+
+  lastHit[drum] = now;
+
+
+  // Convert peak value into strength
+  float scaled =
+
+    (peak - HIT_THRESHOLD[drum]) / 350.0f;
+
+
+  force[drum] = constrain(
+
+    scaled,
+
+    0.0f,
+
+    1.0f
+  );
+
 
   // -------------------------------------
-  // Capture peak knock strength
+  // Print hit information
   // -------------------------------------
 
-  if (collectingHit) {
+  Serial.print("DRUM ");
 
-    if (delta > capturePeak) {
+  Serial.print(drum + 1);
 
-      capturePeak = delta;
-    }
+  Serial.print(" HIT! peak delta=");
 
+  Serial.print(peak);
 
-    // Finish collecting peak
-    if (now - captureStartMs >= captureWindowMs) {
+  Serial.print(" strength=");
 
-      collectingHit = false;
-
-      lastHitMs = now;
-
-
-      // Convert knock strength to light intensity
-      float scaled =
-        (capturePeak - hitThreshold) / 350.0f;
-
-      hitIntensity = constrain(
-        0.35f + scaled,
-        0.35f,
-        1.0f
-      );
+  Serial.println(
+    (int)(35.0f + force[drum] * 65.0f)
+  );
 
 
-      // -------------------------------------
-      // Print actual knock information
-      // -------------------------------------
+  // -------------------------------------
+  // Detect simultaneous hits
+  // -------------------------------------
 
-      Serial.print("Drum 1 HIT! Peak delta: ");
+  if (
 
-      Serial.print(capturePeak);
+    fusionMask == 0 ||
 
-      Serial.print(" | Strength: ");
-
-      Serial.println(
-        (int)(hitIntensity * 100.0f)
-      );
-    }
-
-  } else if (
-
-    delta >= hitThreshold &&
-
-    now - lastHitMs >= hitCooldownMs
+    now - fusionStart > FUSION_WINDOW_MS
 
   ) {
 
-    // Start detecting a new knock
-    collectingHit = true;
+    // Start a new group
+    fusionMask = (1 << drum);
 
-    captureStartMs = now;
+    fusionStart = now;
 
-    capturePeak = delta;
+  } else {
+
+    // Add drum to existing group
+    fusionMask |= (1 << drum);
   }
 
 
+  fusionLastHit = now;
+
+
   // -------------------------------------
-  // Print sensor readings every 500 ms
+  // Show fusion in Serial Monitor
   // -------------------------------------
 
-  if (now - lastDebugMs >= 500) {
+  if (countDrums(fusionMask) > 1) {
 
-    lastDebugMs = now;
+    Serial.print("FUSION: ");
 
-    Serial.print("A0 RAW: ");
+    for (int i = 0; i < NUM_DRUMS; i++) {
 
-    Serial.print(raw);
+      if (fusionMask & (1 << i)) {
 
-    Serial.print(" | idle: ");
+        Serial.print("Drum ");
 
-    Serial.print((int)baseline);
+        Serial.print(i + 1);
 
-    Serial.print(" | delta: ");
+        Serial.print(" ");
+      }
+    }
 
-    Serial.println(delta);
+    Serial.println();
   }
 }
 
 
 // =====================================================
-// 9. NEON RAINBOW + DRUM LIGHT EFFECT
+// 13. READ ALL THREE PIEZO SENSORS
 // =====================================================
 
-void renderNeonFrame(unsigned long now) {
+void sampleAllDrums(unsigned long now) {
 
-  // Avoid using TWO_PI as a variable name
-  const float neonTau = 6.2831853f;
-
-
-  // -------------------------------------
-  // Breathing light animation
-  // -------------------------------------
-
-  float breathing =
-    0.5f +
-    0.5f * sinf(now * 0.0015f);
+  for (int i = 0; i < NUM_DRUMS; i++) {
 
 
-  // -------------------------------------
-  // Calculate knock flash intensity
-  // -------------------------------------
+    // Read actual sensor voltage
+    int raw = analogRead(PIEZO_PINS[i]);
 
-  float flash = 0.0f;
+    latestRaw[i] = raw;
 
-  unsigned long age = now - lastHitMs;
 
-  if (age < fadeMs) {
+    // Difference from resting value
+    int delta = abs(
+      raw - (int)baseline[i]
+    );
 
-    flash =
-      hitIntensity *
-      (1.0f - age / (float)fadeMs);
+
+    // -------------------------------------
+    // Update resting baseline
+    // -------------------------------------
+
+    if (
+
+      !capturing[i] &&
+
+      delta < 15
+
+    ) {
+
+      baseline[i] =
+
+        0.995f * baseline[i] +
+
+        0.005f * raw;
+    }
+
+
+    // -------------------------------------
+    // Capture hit peak
+    // -------------------------------------
+
+    if (capturing[i]) {
+
+      if (delta > capturePeak[i]) {
+
+        capturePeak[i] = delta;
+      }
+
+
+      if (
+
+        now - captureStart[i] >= PEAK_WINDOW_MS
+
+      ) {
+
+        capturing[i] = false;
+
+        registerHit(
+
+          i,
+
+          capturePeak[i],
+
+          now
+        );
+      }
+
+    } else if (
+
+      delta >= HIT_THRESHOLD[i] &&
+
+      now - lastHit[i] >= COOLDOWN_MS
+
+    ) {
+
+      capturing[i] = true;
+
+      captureStart[i] = now;
+
+      capturePeak[i] = delta;
+    }
   }
 
 
   // -------------------------------------
-  // Generate colours for all 72 LEDs
+  // Print all sensor readings
   // -------------------------------------
 
-  for (int pixel = 0; pixel < numLeds; pixel++) {
+  if (now - lastDebug >= 650) {
 
-    // Rainbow position
-    uint8_t hue =
+    lastDebug = now;
 
-      (pixel * 256 / numLeds +
-       rainbowPhase) & 255;
 
+    Serial.print("A0=");
+
+    Serial.print(latestRaw[0]);
+
+
+    Serial.print(" A1=");
+
+    Serial.print(latestRaw[1]);
+
+
+    Serial.print(" A2=");
+
+    Serial.println(latestRaw[2]);
+  }
+}
+
+
+// =====================================================
+// 14. CALCULATE FUSED COLOUR
+// =====================================================
+
+RGB fusionColour() {
+
+  RGB mixed = {
+
+    0, 0, 0
+
+  };
+
+
+  float weightSum = 0.0f;
+
+
+  for (int i = 0; i < NUM_DRUMS; i++) {
+
+
+    // Skip drums not involved in fusion
+    if (!(fusionMask & (1 << i))) {
+
+      continue;
+    }
+
+
+    // Get each drum's current colour
+    RGB c = drumColour(
+
+      i,
+
+      force[i]
+    );
+
+
+    // Stronger hits influence the mixture more
+    float weight =
+
+      0.45f +
+
+      0.55f * force[i];
+
+
+    mixed.r += c.r * weight;
+
+    mixed.g += c.g * weight;
+
+    mixed.b += c.b * weight;
+
+
+    weightSum += weight;
+  }
+
+
+  if (weightSum > 0.0f) {
+
+    mixed.r /= weightSum;
+
+    mixed.g /= weightSum;
+
+    mixed.b /= weightSum;
+  }
+
+
+  return mixed;
+}
+
+
+// =====================================================
+// 15. CONVERT COLOUR TO BYTE
+// =====================================================
+
+uint8_t toByte(float value) {
+
+  return (uint8_t)constrain(
+
+    value,
+
+    0.0f,
+
+    255.0f
+  );
+}
+
+
+// =====================================================
+// 16. CREATE THREE-ZONE LIGHTING ANIMATION
+// =====================================================
+
+void renderLights(unsigned long now) {
+
+
+  // -------------------------------------
+  // Is there a current multi-drum fusion?
+  // -------------------------------------
+
+  bool fusionActive =
+
+    countDrums(fusionMask) >= 2 &&
+
+    now - fusionLastHit < FADE_MS;
+
+
+  RGB blend = {
+
+    0, 0, 0
+
+  };
+
+
+  float blendAlpha = 0.0f;
+
+
+  // -------------------------------------
+  // Calculate fusion colour and brightness
+  // -------------------------------------
+
+  if (fusionActive) {
+
+    blend = fusionColour();
+
+
+    float strongest = 0.0f;
+
+
+    for (int i = 0; i < NUM_DRUMS; i++) {
+
+      if (
+
+        (fusionMask & (1 << i)) &&
+
+        force[i] > strongest
+
+      ) {
+
+        strongest = force[i];
+      }
+    }
+
+
+    float fade =
+
+      1.0f -
+
+      (now - fusionLastHit) / (float)FADE_MS;
+
+
+    blendAlpha =
+
+      (0.50f + 0.50f * strongest) *
+
+      fade;
+  }
+
+
+  // -------------------------------------
+  // Calculate every LED colour
+  // -------------------------------------
+
+  for (int pixel = 0; pixel < NUM_LEDS; pixel++) {
+
+
+    // Determine which drum owns this LED
+    int drum = pixel / LEDS_PER_DRUM;
+
+
+    // -------------------------------------
+    // Animated rainbow background
+    // -------------------------------------
 
     uint8_t r, g, b;
 
-    rainbowRGB(hue, r, g, b);
+
+    rainbowRGB(
+
+      (pixel * 256 / NUM_LEDS +
+       rainbowPhase) & 255,
+
+      r,
+
+      g,
+
+      b
+    );
 
 
-    // -------------------------------------
-    // Moving neon wave
-    // -------------------------------------
-
+    // Moving brightness wave
     float wave =
 
       0.5f +
 
       0.5f * sinf(
 
-        neonTau *
-        pixel /
-        (float)numLeds *
-        2.0f +
+        pixel * 0.34f +
 
-        now * 0.0025f
+        now * 0.003f
       );
 
 
+    float baseBrightness =
+
+      0.17f +
+
+      0.13f * wave;
+
+
+    RGB base = {
+
+      r * baseBrightness,
+
+      g * baseBrightness,
+
+      b * baseBrightness
+
+    };
+
+
+    RGB chosen = base;
+
+    float alpha = 0.0f;
+
+
     // -------------------------------------
-    // Background brightness
+    // MULTIPLE DRUMS: FUSED COLOUR
     // -------------------------------------
 
-    float brightness =
+    if (
 
-      0.28f +
+      fusionActive &&
 
-      0.22f * wave +
+      (fusionMask & (1 << drum))
 
-      0.10f * breathing;
+    ) {
+
+      chosen = blend;
+
+      alpha = blendAlpha;
+
+    } else {
+
+
+      // -------------------------------------
+      // SINGLE DRUM: ITS OWN COLOUR
+      // -------------------------------------
+
+      unsigned long age =
+
+        now - lastHit[drum];
+
+
+      if (age < FADE_MS) {
+
+
+        float fade =
+
+          1.0f -
+
+          age / (float)FADE_MS;
+
+
+        chosen = drumColour(
+
+          drum,
+
+          force[drum]
+        );
+
+
+        // Minimum brightness makes light taps visible
+        alpha =
+
+          (0.48f + 0.52f * force[drum]) *
+
+          fade;
+      }
+    }
 
 
     // -------------------------------------
-    // Apply cyan knock flash
+    // BLEND ACTIVE COLOUR WITH BACKGROUND
     // -------------------------------------
 
-    rgbPayload[pixel * 3 + 0] =
+    rgbPayload[pixel * 3 + 0] = toByte(
 
-      (uint8_t)constrain(
+      base.r * (1.0f - alpha) +
 
-        r * brightness +
-        80.0f * flash,
-
-        0.0f,
-        255.0f
-      );
+      chosen.r * alpha
+    );
 
 
-    rgbPayload[pixel * 3 + 1] =
+    rgbPayload[pixel * 3 + 1] = toByte(
 
-      (uint8_t)constrain(
+      base.g * (1.0f - alpha) +
 
-        g * brightness +
-        205.0f * flash,
-
-        0.0f,
-        255.0f
-      );
+      chosen.g * alpha
+    );
 
 
-    rgbPayload[pixel * 3 + 2] =
+    rgbPayload[pixel * 3 + 2] = toByte(
 
-      (uint8_t)constrain(
+      base.b * (1.0f - alpha) +
 
-        b * brightness +
-        255.0f * flash,
-
-        0.0f,
-        255.0f
-      );
+      chosen.b * alpha
+    );
   }
 
 
-  // Move rainbow forward
+  // Move rainbow animation
   rainbowPhase += 2;
 }
 
 
 // =====================================================
-// 10. WIFI AND MQTT CONNECTION
+// 17. WIFI AND MQTT CONNECTION
 // =====================================================
 
 void serviceNetwork(unsigned long now) {
 
 
   // -------------------------------------
-  // Check WiFi
+  // WiFi connection
   // -------------------------------------
 
   if (WiFi.status() != WL_CONNECTED) {
 
     if (
 
-      now - lastWifiAttemptMs >= 10000UL ||
+      lastWifiAttempt == 0 ||
 
-      lastWifiAttemptMs == 0
+      now - lastWifiAttempt >= 10000UL
 
     ) {
 
-      lastWifiAttemptMs = now;
+      lastWifiAttempt = now;
 
       Serial.println("Connecting to WiFi...");
 
-      WiFi.begin(ssid, wifiPassword);
+      WiFi.begin(
+
+        WIFI_SSID,
+
+        WIFI_PASSWORD
+      );
     }
 
     return;
@@ -441,20 +915,20 @@ void serviceNetwork(unsigned long now) {
 
 
   // -------------------------------------
-  // Check MQTT
+  // MQTT connection
   // -------------------------------------
 
   if (!mqttClient.connected()) {
 
     if (
 
-      now - lastMqttAttemptMs >= 5000UL ||
+      lastMqttAttempt == 0 ||
 
-      lastMqttAttemptMs == 0
+      now - lastMqttAttempt >= 5000UL
 
     ) {
 
-      lastMqttAttemptMs = now;
+      lastMqttAttempt = now;
 
       Serial.println("Connecting to MQTT...");
 
@@ -465,9 +939,9 @@ void serviceNetwork(unsigned long now) {
 
           clientId.c_str(),
 
-          mqttUser,
+          MQTT_USER,
 
-          mqttPassword
+          MQTT_PASSWORD
 
         )
 
@@ -477,7 +951,7 @@ void serviceNetwork(unsigned long now) {
 
       } else {
 
-        Serial.print("MQTT error state: ");
+        Serial.print("MQTT state=");
 
         Serial.println(mqttClient.state());
       }
@@ -487,13 +961,12 @@ void serviceNetwork(unsigned long now) {
   }
 
 
-  // Keep MQTT connection active
   mqttClient.loop();
 }
 
 
 // =====================================================
-// 11. SETUP
+// 18. SETUP
 // =====================================================
 
 void setup() {
@@ -501,54 +974,73 @@ void setup() {
   Serial.begin(115200);
 
 
-  // 10-bit analog input
+  // 10-bit analog readings: 0-1023
   analogReadResolution(10);
 
-  pinMode(piezoPin, INPUT);
-
 
   Serial.println(
-    "Stage 03: Single Piezo + Neon Rainbow"
+    "Stage 05: Three Drum Colour Fusion"
   );
 
 
   // -------------------------------------
-  // Calibrate sensor resting value
+  // Calibrate all three sensors
   // -------------------------------------
 
-  Serial.println(
-    "Keep the piezo still while calibrating..."
-  );
+  // Do not hit drums during calibration
+
+  for (int drum = 0; drum < NUM_DRUMS; drum++) {
 
 
-  long total = 0;
+    pinMode(
 
-  for (int sample = 0; sample < 100; sample++) {
+      PIEZO_PINS[drum],
 
-    total += analogRead(piezoPin);
+      INPUT
+    );
 
-    delay(2);
+
+    long sum = 0;
+
+
+    for (int n = 0; n < 100; n++) {
+
+      sum += analogRead(
+
+        PIEZO_PINS[drum]
+      );
+
+      delay(2);
+    }
+
+
+    baseline[drum] = sum / 100.0f;
+
+
+    Serial.print("A");
+
+    Serial.print(drum);
+
+    Serial.print(" baseline=");
+
+    Serial.println(
+      (int)baseline[drum]
+    );
   }
 
 
-  baseline = total / 100.0f;
-
-
-  Serial.print("Calibrated A0 idle = ");
-
-  Serial.println((int)baseline);
-
-
   // -------------------------------------
-  // Create unique MQTT client ID
+  // Unique MQTT client ID
   // -------------------------------------
 
   byte mac[6] = {0};
+
 
   WiFi.macAddress(mac);
 
 
   char macText[13];
+
 
   snprintf(
 
@@ -574,7 +1066,7 @@ void setup() {
 
   clientId =
 
-    String("MKR1010_Drum_") +
+    String("MKR1010_ThreeDrums_") +
 
     macText;
 
@@ -585,9 +1077,9 @@ void setup() {
 
   mqttClient.setServer(
 
-    mqttServer,
+    MQTT_SERVER,
 
-    mqttPort
+    MQTT_PORT
   );
 
 
@@ -598,13 +1090,13 @@ void setup() {
   mqttClient.setSocketTimeout(2);
 
 
-  // Start connection
+  // Start WiFi / MQTT
   serviceNetwork(millis());
 }
 
 
 // =====================================================
-// 12. MAIN LOOP
+// 19. MAIN LOOP
 // =====================================================
 
 void loop() {
@@ -613,45 +1105,44 @@ void loop() {
 
 
   // -------------------------------------
-  // Step 1: Read real piezo sensor
+  // Step 1: Read all three real sensors
   // -------------------------------------
 
-  samplePiezo(now);
+  sampleAllDrums(now);
 
 
   // -------------------------------------
-  // Step 2: Maintain network connection
+  // Step 2: Maintain network
   // -------------------------------------
 
   serviceNetwork(now);
 
 
   // -------------------------------------
-  // Step 3: Update animation
+  // Step 3: Generate light animation
   // -------------------------------------
 
-  if (now - lastFrameMs >= frameIntervalMs) {
+  if (now - lastFrame >= FRAME_MS) {
 
-    lastFrameMs = now;
+    lastFrame = now;
 
 
-    // Create neon rainbow + knock response
-    renderNeonFrame(now);
+    renderLights(now);
 
 
     // -------------------------------------
-    // Step 4: Publish to Vespera
+    // Step 4: Send all 72 LEDs to Vespera
     // -------------------------------------
 
     if (mqttClient.connected()) {
 
       bool success = mqttClient.publish(
 
-        lightTopic,
+        LIGHT_TOPIC,
 
         rgbPayload,
 
-        payloadSize
+        PAYLOAD_SIZE
       );
 
 
