@@ -1,0 +1,346 @@
+/*
+  TEST 03 — LED ZONES, MQTT, AND REAL DRUM LIGHT RESPONSE
+
+  Board: Arduino MKR WiFi 1010
+  Sensors: A0 / A1 / A2 (three protected piezo circuits)
+  Lighting: 72 RGB LEDs driven remotely over MQTT
+
+  Stage A (automatic): Each 24-LED zone lights in turn. This tests
+  Wi-Fi, MQTT and LED mapping; it does NOT simulate a piezo hit.
+  Stage B (interactive): Real drum hits change colour with strength,
+  fade out and blend when two or three drums are hit close together.
+
+  Install: WiFiNINA and PubSubClient libraries.
+  Create a PRIVATE arduino_secrets.h beside this sketch, defining:
+    SECRET_SSID, SECRET_PASS, SECRET_MQTTUSER, SECRET_MQTTPASS
+  For eduroam, also define SECRET_WIFIUSER (and preferably a verified
+  SECRET_WIFI_CA). Never commit arduino_secrets.h to GitHub.
+*/
+
+#include <SPI.h>
+#include <WiFiNINA.h>
+#include <PubSubClient.h>
+#include "arduino_secrets.h"
+
+const char* const WIFI_SSID = SECRET_SSID;
+const char* const WIFI_PASSWORD = SECRET_PASS;
+const char* const MQTT_USER = SECRET_MQTTUSER;
+const char* const MQTT_PASSWORD = SECRET_MQTTPASS;
+const char* const MQTT_SERVER = "mqtt.cetools.org";
+const uint16_t MQTT_PORT = 1884;
+const char* const MQTT_TOPIC = "student/CASA0014/luminaire/17";
+
+const uint8_t DRUM_COUNT = 3;
+const uint8_t LED_COUNT = 72;
+const uint8_t LEDS_PER_ZONE = 24;
+const uint16_t PAYLOAD_SIZE = LED_COUNT * 3;
+const uint8_t DRUM_PINS[DRUM_COUNT] = {A0, A1, A2};
+
+// Tune these using Test 01 and Test 02. Larger = fewer false hits.
+const int HIT_THRESHOLD[DRUM_COUNT] = {45, 48, 55};
+// Approximate peak delta of a firm hit for each sensor.
+const int STRONG_PEAK[DRUM_COUNT] = {300, 150, 550};
+
+const unsigned long PEAK_WINDOW_MS = 12;
+const unsigned long COOLDOWN_MS = 150;
+const unsigned long FUSION_WINDOW_MS = 115;
+const unsigned long FADE_MS = 380;
+const unsigned long FRAME_MS = 85;
+const unsigned long ZONE_TEST_MS = 1250;
+const unsigned long STARTUP_TEST_MS = ZONE_TEST_MS * 3UL + 500UL;
+
+WiFiClient netClient;
+PubSubClient mqttClient(netClient);
+uint8_t pixels[PAYLOAD_SIZE];
+String mqttClientId;
+
+float baseline[DRUM_COUNT] = {0, 0, 0};
+bool capturing[DRUM_COUNT] = {false, false, false};
+unsigned long captureTime[DRUM_COUNT] = {0, 0, 0};
+int capturePeak[DRUM_COUNT] = {0, 0, 0};
+unsigned long lastHit[DRUM_COUNT] = {0, 0, 0};
+bool hasHit[DRUM_COUNT] = {false, false, false};
+float hitStrength[DRUM_COUNT] = {0, 0, 0};
+
+uint8_t fusionMask = 0;
+unsigned long fusionFirstTime = 0;
+unsigned long fusionLatestTime = 0;
+
+unsigned long lastWifiAttempt = 0;
+unsigned long lastMqttAttempt = 0;
+unsigned long lastFrameTime = 0;
+unsigned long startupStartTime = 0;
+bool startupTestActive = false;
+bool startupCompleteReported = false;
+
+struct Colour { float r; float g; float b; };
+
+uint8_t byteValue(float v) {
+  if (v < 0.0f) return 0;
+  if (v > 255.0f) return 255;
+  return (uint8_t)v;
+}
+
+float unitValue(float v) {
+  if (v < 0.0f) return 0.0f;
+  if (v > 1.0f) return 1.0f;
+  return v;
+}
+
+void setPixel(int pixel, Colour c, float brightness) {
+  pixels[pixel * 3 + 0] = byteValue(c.r * brightness);
+  pixels[pixel * 3 + 1] = byteValue(c.g * brightness);
+  pixels[pixel * 3 + 2] = byteValue(c.b * brightness);
+}
+
+Colour drumColour(int drum, float strength) {
+  strength = unitValue(strength);
+  if (drum == 0) { // violet to neon pink
+    return {150 + 105 * strength, 65 - 35 * strength, 245 - 65 * strength};
+  }
+  if (drum == 1) { // blue cyan to fresh mint
+    return {20 + 30 * strength, 165 + 90 * strength, 255 - 105 * strength};
+  }
+  // warm gold to coral
+  return {255, 205 - 125 * strength, 35 + 25 * strength};
+}
+
+int memberCount(uint8_t mask) {
+  int count = 0;
+  for (int i = 0; i < DRUM_COUNT; ++i) {
+    if (mask & (1 << i)) ++count;
+  }
+  return count;
+}
+
+Colour blendedColour() {
+  Colour result = {0, 0, 0};
+  float totalWeight = 0;
+  for (int drum = 0; drum < DRUM_COUNT; ++drum) {
+    if (!(fusionMask & (1 << drum))) continue;
+    Colour c = drumColour(drum, hitStrength[drum]);
+    float weight = 0.6f + 0.4f * hitStrength[drum];
+    result.r += c.r * weight;
+    result.g += c.g * weight;
+    result.b += c.b * weight;
+    totalWeight += weight;
+  }
+  if (totalWeight > 0) {
+    result.r /= totalWeight;
+    result.g /= totalWeight;
+    result.b /= totalWeight;
+  }
+  return result;
+}
+
+void addRealHit(int drum, int peak, unsigned long now) {
+  hasHit[drum] = true;
+  lastHit[drum] = now;
+
+  int usefulRange = STRONG_PEAK[drum] - HIT_THRESHOLD[drum];
+  if (usefulRange < 1) usefulRange = 1;
+  hitStrength[drum] = unitValue(
+      (peak - HIT_THRESHOLD[drum]) / (float)usefulRange);
+
+  Serial.print(F("[HIT] Drum "));
+  Serial.print(drum + 1);
+  Serial.print(F(" | peak delta="));
+  Serial.print(peak);
+  Serial.print(F(" | strength="));
+  Serial.println((int)(35 + hitStrength[drum] * 65));
+
+  if (fusionMask == 0 || now - fusionFirstTime > FUSION_WINDOW_MS) {
+    fusionMask = (1 << drum);
+    fusionFirstTime = now;
+  } else {
+    fusionMask |= (1 << drum);
+  }
+  fusionLatestTime = now;
+
+  if (memberCount(fusionMask) >= 2) {
+    Serial.print(F("[FUSION] "));
+    Serial.print(memberCount(fusionMask));
+    Serial.println(F(" drums share one blended colour"));
+  }
+}
+
+void readRealDrums(unsigned long now) {
+  for (int drum = 0; drum < DRUM_COUNT; ++drum) {
+    int raw = analogRead(DRUM_PINS[drum]);
+    int delta = abs(raw - (int)baseline[drum]);
+
+    if (!capturing[drum] && delta < 15) {
+      baseline[drum] = baseline[drum] * 0.995f + raw * 0.005f;
+    }
+
+    if (capturing[drum]) {
+      if (delta > capturePeak[drum]) capturePeak[drum] = delta;
+      if (now - captureTime[drum] >= PEAK_WINDOW_MS) {
+        capturing[drum] = false;
+        // One high reading starts a capture; the maximum confirms it.
+        if (capturePeak[drum] >= HIT_THRESHOLD[drum]) {
+          addRealHit(drum, capturePeak[drum], now);
+        }
+      }
+    } else if (delta >= HIT_THRESHOLD[drum] &&
+               (!hasHit[drum] || now - lastHit[drum] >= COOLDOWN_MS)) {
+      capturing[drum] = true;
+      captureTime[drum] = now;
+      capturePeak[drum] = delta;
+    }
+  }
+}
+
+// Hardware lighting self-test: no fake piezo readings.
+void renderZoneSelfTest(unsigned long now) {
+  for (int i = 0; i < PAYLOAD_SIZE; ++i) pixels[i] = 0;
+  unsigned long elapsed = now - startupStartTime;
+  if (elapsed >= ZONE_TEST_MS * 3UL) return;
+
+  int activeZone = elapsed / ZONE_TEST_MS;
+  Colour c = drumColour(activeZone, 0.7f);
+  for (int pixel = activeZone * LEDS_PER_ZONE;
+       pixel < (activeZone + 1) * LEDS_PER_ZONE; ++pixel) {
+    setPixel(pixel, c, 0.65f);
+  }
+}
+
+void renderRealDrumLights(unsigned long now) {
+  for (int i = 0; i < PAYLOAD_SIZE; ++i) pixels[i] = 0;
+  bool fusionActive = memberCount(fusionMask) >= 2 &&
+                      now - fusionLatestTime < FADE_MS;
+  Colour fusionColour = blendedColour();
+
+  for (int pixel = 0; pixel < LED_COUNT; ++pixel) {
+    int drum = pixel / LEDS_PER_ZONE;
+    if (!hasHit[drum]) continue;
+
+    Colour c = drumColour(drum, hitStrength[drum]);
+    unsigned long age = now - lastHit[drum];
+    if (age >= FADE_MS) continue;
+
+    // Gentle hits stay visible; quadratic fade creates a short tail.
+    float remaining = 1.0f - age / (float)FADE_MS;
+    float brightness = (0.50f + 0.50f * hitStrength[drum]) *
+                       remaining * remaining;
+
+    if (fusionActive && (fusionMask & (1 << drum))) {
+      c = fusionColour;
+      float fusionRemaining = 1.0f -
+                              (now - fusionLatestTime) / (float)FADE_MS;
+      brightness = (0.55f + 0.45f * hitStrength[drum]) *
+                   fusionRemaining * fusionRemaining;
+    }
+    setPixel(pixel, c, brightness);
+  }
+}
+
+void beginWifiConnection() {
+#if defined(SECRET_WIFIUSER) && defined(SECRET_WIFI_CA)
+  // Preferred eduroam option: pass the university-approved CA certificate.
+  WiFi.beginEnterprise(WIFI_SSID, SECRET_WIFIUSER, WIFI_PASSWORD,
+                       SECRET_WIFIUSER, SECRET_WIFI_CA);
+#elif defined(SECRET_WIFIUSER)
+  // For diagnostics only: does not supply a CA certificate.
+  // Ask your university IT team for the correct CA/identity setup.
+  WiFi.beginEnterprise(WIFI_SSID, SECRET_WIFIUSER, WIFI_PASSWORD);
+#else
+  // Conventional WPA2 personal Wi-Fi / phone hotspot.
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+#endif
+}
+
+void maintainConnections(unsigned long now) {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (lastWifiAttempt == 0 || now - lastWifiAttempt >= 10000UL) {
+      lastWifiAttempt = now;
+      Serial.println(F("[WIFI] Connecting..."));
+      beginWifiConnection();
+    }
+    return;
+  }
+
+  if (!mqttClient.connected()) {
+    if (lastMqttAttempt == 0 || now - lastMqttAttempt >= 5000UL) {
+      lastMqttAttempt = now;
+      Serial.println(F("[MQTT] Connecting..."));
+      if (mqttClient.connect(mqttClientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
+        Serial.println(F("[MQTT] Connected. Starting LED zone self-test."));
+        startupStartTime = millis();
+        startupTestActive = true;
+        startupCompleteReported = false;
+      } else {
+        Serial.print(F("[MQTT] Failed, state="));
+        Serial.println(mqttClient.state());
+      }
+    }
+    return;
+  }
+  mqttClient.loop();
+}
+
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(10);
+  Serial.println(F("TEST 03 | 72-LED MQTT zone + real piezo test"));
+  Serial.println(F("Calibrating... Do not touch the drum pads."));
+
+  for (int drum = 0; drum < DRUM_COUNT; ++drum) {
+    pinMode(DRUM_PINS[drum], INPUT);
+    long sum = 0;
+    for (int sample = 0; sample < 100; ++sample) {
+      sum += analogRead(DRUM_PINS[drum]);
+      delay(2);
+    }
+    baseline[drum] = sum / 100.0f;
+    Serial.print(F("[CAL] Drum "));
+    Serial.print(drum + 1);
+    Serial.print(F(" baseline="));
+    Serial.println((int)baseline[drum]);
+  }
+
+  byte mac[6] = {0};
+  WiFi.macAddress(mac);
+  char idSuffix[13];
+  snprintf(idSuffix, sizeof(idSuffix), "%02X%02X%02X%02X%02X%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  mqttClientId = String("CASA0014_Test03_") + idSuffix;
+
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  if (!mqttClient.setBufferSize(512)) {
+    Serial.println(F("[ERROR] Cannot allocate MQTT buffer (512 bytes)."));
+  }
+  mqttClient.setKeepAlive(30);
+  mqttClient.setSocketTimeout(2);
+  Serial.println(F("Waiting for WiFi / MQTT. Serial Monitor: 115200."));
+}
+
+void loop() {
+  unsigned long now = millis();
+  readRealDrums(now);  // Actual A0/A1/A2 analog measurements.
+  maintainConnections(now);
+
+  if (now - lastFrameTime < FRAME_MS) return;
+  lastFrameTime = now;
+  if (!mqttClient.connected()) return;
+
+  if (startupTestActive) {
+    if (now - startupStartTime < STARTUP_TEST_MS) {
+      renderZoneSelfTest(now);
+    } else {
+      startupTestActive = false;
+      for (int i = 0; i < PAYLOAD_SIZE; ++i) pixels[i] = 0;
+      if (!startupCompleteReported) {
+        Serial.println(F("[READY] Zone 1=A0, Zone 2=A1, Zone 3=A2."));
+        Serial.println(F("Tap real drums; try 2/3 together for fusion."));
+        startupCompleteReported = true;
+      }
+    }
+  } else {
+    renderRealDrumLights(now);
+  }
+
+  if (!mqttClient.publish(MQTT_TOPIC, pixels, PAYLOAD_SIZE)) {
+    Serial.println(F("[MQTT] Publish failed. Check connection/topic."));
+  }
+}
