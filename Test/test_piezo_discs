@@ -1,1 +1,228 @@
 
+/*
+  Rhythm of Light
+  TEST 01 - PIEZO SIGNAL TEST
+
+  Board: Arduino MKR WiFi 1010
+
+  Drum 1 -> A0
+  Drum 2 -> A1
+  Drum 3 -> A2
+
+  Purpose:
+  Test the real analog signals of three piezo sensors.
+
+  No WiFi
+  No MQTT
+  No lights
+  No buzzer
+  No OLED
+
+  IMPORTANT:
+  Verify the input protection circuit before
+  connecting or tapping the piezo sensors.
+*/
+
+const byte DRUM_COUNT = 3;
+
+// Three piezo sensors
+const int DRUM_PINS[DRUM_COUNT] = {
+  A0,
+  A1,
+  A2
+};
+
+// Print results every 500 milliseconds
+const unsigned long REPORT_INTERVAL_MS = 500;
+
+// Store signal readings
+struct SignalStats {
+  int latest;
+  int minimum;
+  int maximum;
+};
+
+SignalStats signal[DRUM_COUNT];
+
+unsigned long reportStartMs = 0;
+unsigned long sampleCount = 0;
+
+
+// =====================================
+// Reset signal statistics
+// =====================================
+
+void resetSignalStats() {
+
+  for (byte i = 0; i < DRUM_COUNT; i++) {
+
+    signal[i].latest = 0;
+
+    signal[i].minimum = 1023;
+
+    signal[i].maximum = 0;
+  }
+
+  sampleCount = 0;
+}
+
+
+// =====================================
+// Read three piezo sensors
+// =====================================
+
+void samplePiezoSensors() {
+
+  for (byte i = 0; i < DRUM_COUNT; i++) {
+
+    int raw = analogRead(DRUM_PINS[i]);
+
+    signal[i].latest = raw;
+
+    if (raw < signal[i].minimum) {
+      signal[i].minimum = raw;
+    }
+
+    if (raw > signal[i].maximum) {
+      signal[i].maximum = raw;
+    }
+  }
+
+  sampleCount++;
+}
+
+
+// =====================================
+// Print test results
+// =====================================
+
+void printSignalReport(unsigned long elapsedMs) {
+
+  Serial.println();
+
+  Serial.print(F("--- Signal window: "));
+  Serial.print(elapsedMs);
+
+  Serial.print(F(" ms | samples per drum: "));
+  Serial.print(sampleCount);
+
+  Serial.println(F(" ---"));
+
+  for (byte i = 0; i < DRUM_COUNT; i++) {
+
+    int swing =
+      signal[i].maximum - signal[i].minimum;
+
+    Serial.print(F("DRUM "));
+    Serial.print(i + 1);
+
+    Serial.print(F(" (A"));
+    Serial.print(i);
+
+    Serial.print(F(") RAW="));
+    Serial.print(signal[i].latest);
+
+    Serial.print(F(" MIN="));
+    Serial.print(signal[i].minimum);
+
+    Serial.print(F(" MAX="));
+    Serial.print(signal[i].maximum);
+
+    Serial.print(F(" RANGE="));
+    Serial.println(swing);
+  }
+
+  Serial.println(
+    F("Tip: compare idle data with gentle taps.")
+  );
+}
+
+
+// =====================================
+// SETUP
+// =====================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  // Wait briefly for Serial Monitor
+  unsigned long serialWaitStart = millis();
+
+  while (
+    !Serial &&
+    millis() - serialWaitStart < 2500
+  ) {
+  }
+
+  // 10-bit ADC: 0 to 1023
+  analogReadResolution(10);
+
+  for (byte i = 0; i < DRUM_COUNT; i++) {
+
+    pinMode(DRUM_PINS[i], INPUT);
+  }
+
+  resetSignalStats();
+
+  reportStartMs = millis();
+
+  Serial.println(
+    F("====================================")
+  );
+
+  Serial.println(
+    F("RHYTHM OF LIGHT - PIEZO SIGNAL TEST")
+  );
+
+  Serial.println(
+    F("Arduino MKR WiFi 1010")
+  );
+
+  Serial.println(
+    F("Testing A0, A1, A2")
+  );
+
+  Serial.println(
+    F("Baud rate: 115200")
+  );
+
+  Serial.println(
+    F("====================================")
+  );
+
+  Serial.println(
+    F("Step 1: Leave all drums untouched.")
+  );
+
+  Serial.println(
+    F("Step 2: Tap one drum at a time.")
+  );
+}
+
+
+// =====================================
+// LOOP
+// =====================================
+
+void loop() {
+
+  // Read sensors continuously
+  samplePiezoSensors();
+
+  unsigned long now = millis();
+
+  if (
+    now - reportStartMs >= REPORT_INTERVAL_MS
+  ) {
+
+    printSignalReport(
+      now - reportStartMs
+    );
+
+    resetSignalStats();
+
+    reportStartMs = millis();
+  }
+}
+
