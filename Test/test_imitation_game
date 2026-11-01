@@ -1,0 +1,841 @@
+/*
+  RHYTHM OF LIGHT — TEST 07: TWO-PLAYER IMITATION GAME
+
+  Hardware: Arduino MKR WiFi 1010, protected piezos A0/A1/A2,
+  latching switch D2 -> GND, SSD1306 128x64 OLED over I2C,
+  and the existing 72-LED Vespera MQTT luminaire.
+
+  One switch, one action per stable physical flip:
+    1. Player 1 starts recording a real drum rhythm.
+    2. Player 1 finishes. The original rhythm is saved.
+    3. Play the ORIGINAL rhythm on the real lights.
+       Wait for demonstration to finish automatically.
+    4. Player 2 starts imitating the same three drums.
+    5. Player 2 finishes; show an actual 0..100 match score.
+    6. Start a NEW round with Player 1.
+
+  If the switch is flipped during the demonstration, it skips
+  the remaining demo and moves to WAIT FOR PLAYER 2; it does
+  not falsely claim that the demonstration was completed.
+
+  The score rewards correct drum identity (50%), relative
+  timing (30%) and hit strength (20%). Missing/extra hits incur
+  an insertion/deletion penalty. Event-sequence alignment uses
+  two short DP rows, to fit MKR WiFi 1010 RAM.
+
+  Times are normalized to the FIRST real hit for each player,
+  so waiting before starting the rhythm is not penalized.
+  Recording is RAM-only: power loss erases both performances.
+
+  This is a real input/output test, not a simulated performance.
+  No buzzer output in this standalone integration test.
+
+  Private arduino_secrets.h needed beside the sketch:
+  SECRET_SSID, SECRET_PASS, SECRET_MQTTUSER, SECRET_MQTTPASS;
+  for eduroam also SECRET_WIFIUSER and ideally the university-
+  verified SECRET_WIFI_CA. Never commit credentials to GitHub.
+*/
+
+#include <SPI.h>
+#include <WiFiNINA.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "arduino_secrets.h"
+
+const char* WIFI_SSID = SECRET_SSID;
+const char* WIFI_PASS = SECRET_PASS;
+const char* MQTT_USER = SECRET_MQTTUSER;
+const char* MQTT_PASS = SECRET_MQTTPASS;
+const char* MQTT_SERVER = "mqtt.cetools.org";
+const uint16_t MQTT_PORT = 1884;
+const char* LIGHT_TOPIC = "student/CASA0014/luminaire/17";
+
+const byte DRUM_COUNT = 3;
+const byte PIEZO_PINS[DRUM_COUNT] = {A0, A1, A2};
+const byte SWITCH_PIN = 2;
+const int LED_COUNT = 72;
+const int LEDS_PER_DRUM = 24;
+const int PAYLOAD_SIZE = LED_COUNT * 3;
+
+int HIT_THRESHOLD[DRUM_COUNT] = {40, 48, 55};
+const int STRONG_PEAK[DRUM_COUNT] = {300, 150, 550};
+
+const unsigned long PEAK_WINDOW_MS = 12;
+const unsigned long COOLDOWN_MS = 150;
+const unsigned long REARM_QUIET_MS = 25;
+const unsigned long SWITCH_DEBOUNCE_MS = 45;
+const unsigned long FUSION_MS = 115;
+const unsigned long FADE_MS = 370;
+const unsigned long LIGHT_FRAME_MS = 85;
+const unsigned long OLED_FRAME_MS = 180;
+const unsigned long NOTICE_MS = 1000;
+const unsigned long TIMING_TOLERANCE_MS = 400;
+
+const int MAX_EVENTS = 120;
+struct DrumEvent {
+  unsigned long timeMs;  // Offset from that player's FIRST hit.
+  uint16_t peakDelta;
+  uint8_t drum;          // 0, 1, 2
+  uint8_t strength;      // 1..100, relative to that drum's range
+};
+DrumEvent originalHits[MAX_EVENTS];
+DrumEvent imitationHits[MAX_EVENTS];
+int originalCount = 0;
+int imitationCount = 0;
+bool originalStarted = false;
+bool imitationStarted = false;
+unsigned long originalFirstTime = 0;
+unsigned long imitationFirstTime = 0;
+
+enum GameMode {
+  GAME_READY,
+  GAME_P1_RECORD,
+  GAME_P1_SAVED,
+  GAME_DEMO,
+  GAME_WAIT_P2,
+  GAME_P2_RECORD,
+  GAME_SCORE
+};
+GameMode gameMode = GAME_READY;
+int finalScore = 0;
+int demoIndex = 0;
+unsigned long demoStartTime = 0;
+
+// Scoring: two rows of edit-distance dynamic programming.
+// Costs are integers from 0 to 100 per hit, never > 12,000.
+uint16_t scorePrevious[MAX_EVENTS + 1];
+uint16_t scoreCurrent[MAX_EVENTS + 1];
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+String mqttClientId;
+uint8_t rgbPayload[PAYLOAD_SIZE];
+unsigned long lastWifiAttempt = 0;
+unsigned long lastMqttAttempt = 0;
+unsigned long lastLightFrame = 0;
+
+Adafruit_SSD1306 oled(128, 64, &Wire, -1);
+bool oledReady = false;
+unsigned long lastOledFrame = 0;
+const char* noticeLine1 = "";
+const char* noticeLine2 = "";
+unsigned long noticeStart = 0;
+bool noticeActive = false;
+
+int rawSwitch = HIGH;
+int stableSwitch = HIGH;
+unsigned long rawSwitchChangeAt = 0;
+
+float baseline[DRUM_COUNT] = {0, 0, 0};
+bool capturing[DRUM_COUNT] = {false, false, false};
+bool armed[DRUM_COUNT] = {true, true, true};
+bool hasHit[DRUM_COUNT] = {false, false, false};
+int capturePeak[DRUM_COUNT] = {0, 0, 0};
+unsigned long captureStart[DRUM_COUNT] = {0, 0, 0};
+unsigned long lastRealHit[DRUM_COUNT] = {0, 0, 0};
+unsigned long quietStart[DRUM_COUNT] = {0, 0, 0};
+
+bool lit[DRUM_COUNT] = {false, false, false};
+float litStrength[DRUM_COUNT] = {0, 0, 0};
+unsigned long litAt[DRUM_COUNT] = {0, 0, 0};
+uint8_t fusionMask = 0;
+unsigned long fusionFirstTime = 0;
+unsigned long fusionLatestTime = 0;
+int mostRecentDrum = -1;
+int mostRecentStrength = 0;
+
+struct RGB { float r; float g; float b; };
+
+float clampUnit(float value) {
+  if (value < 0.0f) return 0.0f;
+  if (value > 1.0f) return 1.0f;
+  return value;
+}
+
+uint8_t clampByte(float value) {
+  if (value < 0.0f) return 0;
+  if (value > 255.0f) return 255;
+  return (uint8_t)value;
+}
+
+void setNotice(const char* first, const char* second) {
+  noticeLine1 = first;
+  noticeLine2 = second;
+  noticeStart = millis();
+  noticeActive = true;
+}
+
+void clearLights() {
+  for (byte i = 0; i < DRUM_COUNT; ++i) {
+    lit[i] = false;
+    litStrength[i] = 0;
+    litAt[i] = 0;
+  }
+  fusionMask = 0;
+  fusionFirstTime = 0;
+  fusionLatestTime = 0;
+  for (int i = 0; i < PAYLOAD_SIZE; ++i) rgbPayload[i] = 0;
+}
+
+RGB drumColour(byte drum, float strength) {
+  strength = clampUnit(strength);
+  if (drum == 0) {
+    return {150 + 105 * strength, 65 - 35 * strength,
+            245 - 65 * strength};
+  }
+  if (drum == 1) {
+    return {20 + 30 * strength, 165 + 90 * strength,
+            255 - 105 * strength};
+  }
+  return {255, 205 - 125 * strength, 35 + 25 * strength};
+}
+
+int countFusionMembers(uint8_t mask) {
+  int total = 0;
+  for (byte drum = 0; drum < DRUM_COUNT; ++drum) {
+    if (mask & (1 << drum)) ++total;
+  }
+  return total;
+}
+
+RGB fusedColour() {
+  RGB result = {0, 0, 0};
+  float totalWeight = 0;
+  for (byte drum = 0; drum < DRUM_COUNT; ++drum) {
+    if (!(fusionMask & (1 << drum))) continue;
+    RGB c = drumColour(drum, litStrength[drum]);
+    float weight = 0.55f + 0.45f * litStrength[drum];
+    result.r += c.r * weight;
+    result.g += c.g * weight;
+    result.b += c.b * weight;
+    totalWeight += weight;
+  }
+  if (totalWeight > 0) {
+    result.r /= totalWeight;
+    result.g /= totalWeight;
+    result.b /= totalWeight;
+  }
+  return result;
+}
+
+void triggerLight(byte drum, byte strength, unsigned long now) {
+  lit[drum] = true;
+  litStrength[drum] = clampUnit(strength / 100.0f);
+  litAt[drum] = now;
+  mostRecentDrum = drum + 1;
+  mostRecentStrength = strength;
+
+  if (fusionMask == 0 || now - fusionFirstTime > FUSION_MS) {
+    fusionMask = (1 << drum);
+    fusionFirstTime = now;
+  } else {
+    fusionMask |= (1 << drum);
+  }
+  fusionLatestTime = now;
+}
+
+void renderLights(unsigned long now) {
+  bool fused = countFusionMembers(fusionMask) >= 2 &&
+               now - fusionLatestTime < FADE_MS;
+  RGB mix = fusedColour();
+
+  for (int pixel = 0; pixel < LED_COUNT; ++pixel) {
+    byte drum = pixel / LEDS_PER_DRUM;
+    RGB c = {0, 0, 0};
+    float brightness = 0;
+
+    if (lit[drum] && now - litAt[drum] < FADE_MS) {
+      float fade = 1.0f - (now - litAt[drum]) / (float)FADE_MS;
+      c = drumColour(drum, litStrength[drum]);
+      brightness = (0.5f + 0.5f * litStrength[drum]) * fade * fade;
+    }
+
+    if (fused && (fusionMask & (1 << drum))) {
+      float fade = 1.0f - (now - fusionLatestTime) / (float)FADE_MS;
+      c = mix;
+      brightness = (0.55f + 0.45f * litStrength[drum]) * fade * fade;
+    }
+
+    rgbPayload[pixel * 3 + 0] = clampByte(c.r * brightness);
+    rgbPayload[pixel * 3 + 1] = clampByte(c.g * brightness);
+    rgbPayload[pixel * 3 + 2] = clampByte(c.b * brightness);
+  }
+}
+
+int relativeStrength(byte drum, int peak) {
+  int low = HIT_THRESHOLD[drum];
+  int high = STRONG_PEAK[drum];
+  if (high <= low) high = low + 1;
+  long result = 1L + (long)(peak - low) * 99L / (high - low);
+  if (result < 1) result = 1;
+  if (result > 100) result = 100;
+  return (int)result;
+}
+
+// Pair similarity: 50% drum identity, 30% relative timing,
+// 20% relative strength. Timing is measured from each first hit.
+int pairCost(const DrumEvent &a, const DrumEvent &b) {
+  if (a.drum != b.drum) return 100;
+
+  unsigned long difference = a.timeMs > b.timeMs ?
+      a.timeMs - b.timeMs : b.timeMs - a.timeMs;
+  int timeScore = 0;
+  if (difference < TIMING_TOLERANCE_MS) {
+    timeScore = 100 -
+        (int)(difference * 100UL / TIMING_TOLERANCE_MS);
+  }
+
+  int strengthDifference = (int)a.strength - (int)b.strength;
+  if (strengthDifference < 0) strengthDifference = -strengthDifference;
+  int strengthScore = 100 - strengthDifference;
+
+  int similarity = 50 + (30 * timeScore + 20 * strengthScore) / 100;
+  return 100 - similarity;
+}
+
+int calculateImitationScore() {
+  if (originalCount == 0 || imitationCount == 0) return 0;
+
+  // Levenshtein-style alignment with weighted substitution costs.
+  // Missing or extra event = cost 100; correct events cost 0..50.
+  for (int j = 0; j <= imitationCount; ++j) {
+    scorePrevious[j] = j * 100;
+  }
+
+  for (int i = 1; i <= originalCount; ++i) {
+    scoreCurrent[0] = i * 100;
+
+    for (int j = 1; j <= imitationCount; ++j) {
+      uint16_t substitution = scorePrevious[j - 1] +
+          pairCost(originalHits[i - 1], imitationHits[j - 1]);
+      uint16_t missing = scorePrevious[j] + 100;
+      uint16_t extra = scoreCurrent[j - 1] + 100;
+
+      uint16_t best = substitution;
+      if (missing < best) best = missing;
+      if (extra < best) best = extra;
+      scoreCurrent[j] = best;
+    }
+
+    for (int j = 0; j <= imitationCount; ++j) {
+      scorePrevious[j] = scoreCurrent[j];
+    }
+  }
+
+  int longest = originalCount > imitationCount ?
+      originalCount : imitationCount;
+  unsigned long denominator = (unsigned long)longest * 100UL;
+  unsigned long cost = scorePrevious[imitationCount];
+  if (cost >= denominator) return 0;
+
+  unsigned long result = 100UL -
+      (cost * 100UL + denominator / 2UL) / denominator;
+  if (result > 100UL) result = 100UL;
+  return (int)result;
+}
+
+void startPlayer1() {
+  if (!mqttClient.connected()) {
+    Serial.println(F("[ERROR] MQTT offline: cannot begin a visible game."));
+    setNotice("MQTT OFFLINE", "TRY AGAIN");
+    return;
+  }
+
+  originalCount = 0;
+  imitationCount = 0;
+  originalStarted = false;
+  imitationStarted = false;
+  finalScore = 0;
+  demoIndex = 0;
+  mostRecentDrum = -1;
+  mostRecentStrength = 0;
+  clearLights();
+  gameMode = GAME_P1_RECORD;
+  setNotice("PLAYER 1", "RECORDING");
+  Serial.println(F("[P1] Recording started. Play a short rhythm."));
+}
+
+void finishPlayer1() {
+  if (gameMode != GAME_P1_RECORD) return;
+  if (originalCount == 0) {
+    gameMode = GAME_READY;
+    setNotice("NO P1 HITS", "TRY AGAIN");
+    Serial.println(F("[P1] No recorded hits; next flip can try again."));
+    return;
+  }
+  gameMode = GAME_P1_SAVED;
+  setNotice("PLAYER 1", "SAVED");
+  Serial.print(F("[P1] Saved original hits="));
+  Serial.print(originalCount);
+  Serial.print(F(" duration="));
+  Serial.print(originalHits[originalCount - 1].timeMs);
+  Serial.println(F("ms from first to last hit."));
+  Serial.println(F("[P1] Flip to demonstrate the ORIGINAL via actual lights."));
+}
+
+void startDemo() {
+  if (originalCount == 0) {
+    Serial.println(F("[DEMO] No original rhythm stored."));
+    return;
+  }
+  if (!mqttClient.connected()) {
+    setNotice("MQTT OFFLINE", "NO DEMO");
+    Serial.println(F("[DEMO] Cannot replay: MQTT is disconnected."));
+    return;
+  }
+
+  gameMode = GAME_DEMO;
+  demoIndex = 0;
+  demoStartTime = millis();
+  clearLights();
+  setNotice("WATCH", "DEMO");
+  Serial.println(F("[DEMO] Started REAL light replay, first hit at t=0ms."));
+}
+
+void demoFinished(bool completed) {
+  if (gameMode != GAME_DEMO) return;
+  clearLights();
+  gameMode = GAME_WAIT_P2;
+  setNotice(completed ? "DEMO DONE" : "DEMO SKIP", "P2 NEXT");
+  Serial.println(completed ?
+      F("[DEMO] Completed. Player 2 can now start.") :
+      F("[DEMO] Skipped by switch. Player 2 can now start."));
+}
+
+void updateDemo(unsigned long now) {
+  if (gameMode != GAME_DEMO) return;
+  if (!mqttClient.connected()) {
+    gameMode = GAME_P1_SAVED;
+    clearLights();
+    setNotice("MQTT LOST", "RETRY DEMO");
+    Serial.println(F("[DEMO] Stopped on network loss; replay not complete."));
+    return;
+  }
+
+  unsigned long elapsed = now - demoStartTime;
+  while (demoIndex < originalCount &&
+         elapsed >= originalHits[demoIndex].timeMs) {
+    const DrumEvent &hit = originalHits[demoIndex];
+    triggerLight(hit.drum, hit.strength, now);
+    Serial.print(F("[DEMO HIT] Drum "));
+    Serial.print(hit.drum + 1);
+    Serial.print(F(" t="));
+    Serial.print(hit.timeMs);
+    Serial.print(F("ms strength="));
+    Serial.println(hit.strength);
+    demoIndex++;
+  }
+
+  if (demoIndex == originalCount &&
+      elapsed >= originalHits[originalCount - 1].timeMs + FADE_MS) {
+    demoFinished(true);
+  }
+}
+
+void startPlayer2() {
+  if (!mqttClient.connected()) {
+    setNotice("MQTT OFFLINE", "P2 WAIT");
+    Serial.println(F("[P2] Cannot start while MQTT is offline."));
+    return;
+  }
+  imitationCount = 0;
+  imitationStarted = false;
+  mostRecentDrum = -1;
+  mostRecentStrength = 0;
+  clearLights();
+  gameMode = GAME_P2_RECORD;
+  setNotice("PLAYER 2", "IMITATING");
+  Serial.println(F("[P2] Imitation started. Match P1's drum order and rhythm."));
+}
+
+void finishPlayer2() {
+  if (gameMode != GAME_P2_RECORD) return;
+  finalScore = calculateImitationScore();
+  gameMode = GAME_SCORE;
+  noticeActive = false; // Show the real score immediately, not a fake state.
+
+  Serial.println(F("=========================================="));
+  Serial.print(F("[RESULT] P1 original hits="));
+  Serial.println(originalCount);
+  Serial.print(F("[RESULT] P2 imitation hits="));
+  Serial.println(imitationCount);
+  Serial.print(F("[RESULT] IMITATION SCORE="));
+  Serial.print(finalScore);
+  Serial.println(F("/100"));
+  Serial.println(F("[RESULT] Drum 50%, timing 30%, strength 20%; missing/extra penalised."));
+  Serial.println(F("[NEXT] Flip once to start a new round."));
+  Serial.println(F("=========================================="));
+}
+
+void storeRealHit(byte drum, int peak, unsigned long now) {
+  if (gameMode != GAME_P1_RECORD && gameMode != GAME_P2_RECORD) return;
+  int strength = relativeStrength(drum, peak);
+
+  DrumEvent *target;
+  int *count;
+  unsigned long *firstTime;
+  bool *started;
+  if (gameMode == GAME_P1_RECORD) {
+    target = originalHits;
+    count = &originalCount;
+    firstTime = &originalFirstTime;
+    started = &originalStarted;
+  } else {
+    target = imitationHits;
+    count = &imitationCount;
+    firstTime = &imitationFirstTime;
+    started = &imitationStarted;
+  }
+
+  if (*count >= MAX_EVENTS) {
+    if (gameMode == GAME_P1_RECORD) finishPlayer1();
+    else finishPlayer2();
+    return;
+  }
+
+  if (!*started) {
+    *started = true;
+    *firstTime = now;
+  }
+
+  DrumEvent &event = target[*count];
+  event.timeMs = now - *firstTime;
+  event.peakDelta = peak;
+  event.drum = drum;
+  event.strength = (byte)strength;
+  (*count)++;
+
+  triggerLight(drum, event.strength, now);
+  Serial.print(gameMode == GAME_P1_RECORD ? F("[P1 HIT] ") : F("[P2 HIT] "));
+  Serial.print(F("Drum "));
+  Serial.print(drum + 1);
+  Serial.print(F(" t="));
+  Serial.print(event.timeMs);
+  Serial.print(F("ms strength="));
+  Serial.println(strength);
+
+  if (*count >= MAX_EVENTS) {
+    Serial.println(F("[WARN] 120 events reached; ending this performance."));
+    if (gameMode == GAME_P1_RECORD) finishPlayer1();
+    else finishPlayer2();
+  }
+}
+
+void readRealDrums(unsigned long now) {
+  for (byte drum = 0; drum < DRUM_COUNT; ++drum) {
+    int raw = analogRead(PIEZO_PINS[drum]);
+    int delta = raw - (int)baseline[drum];
+    if (delta < 0) delta = -delta;
+    int releaseThreshold = HIT_THRESHOLD[drum] * 45 / 100;
+
+    if (!capturing[drum] && delta < releaseThreshold) {
+      baseline[drum] = baseline[drum] * 0.998f + raw * 0.002f;
+    }
+
+    if (capturing[drum]) {
+      if (delta > capturePeak[drum]) capturePeak[drum] = delta;
+      if (now - captureStart[drum] >= PEAK_WINDOW_MS) {
+        capturing[drum] = false;
+        storeRealHit(drum, capturePeak[drum], now);
+        hasHit[drum] = true;
+        lastRealHit[drum] = now;
+        armed[drum] = false;
+        quietStart[drum] = 0;
+      }
+      continue;
+    }
+
+    if (!armed[drum]) {
+      if (delta <= releaseThreshold) {
+        if (quietStart[drum] == 0) quietStart[drum] = now;
+        if (now - quietStart[drum] >= REARM_QUIET_MS &&
+            now - lastRealHit[drum] >= COOLDOWN_MS) {
+          armed[drum] = true;
+        }
+      } else {
+        quietStart[drum] = 0;
+      }
+      continue;
+    }
+
+    if (delta >= HIT_THRESHOLD[drum] &&
+        (!hasHit[drum] || now - lastRealHit[drum] >= COOLDOWN_MS)) {
+      capturing[drum] = true;
+      captureStart[drum] = now;
+      capturePeak[drum] = delta;
+      armed[drum] = false;
+    }
+  }
+}
+
+void handleSwitchFlip() {
+  Serial.println(F("[SWITCH] Stable physical flip detected."));
+  switch (gameMode) {
+    case GAME_READY: startPlayer1(); break;
+    case GAME_P1_RECORD: finishPlayer1(); break;
+    case GAME_P1_SAVED: startDemo(); break;
+    case GAME_DEMO: demoFinished(false); break;
+    case GAME_WAIT_P2: startPlayer2(); break;
+    case GAME_P2_RECORD: finishPlayer2(); break;
+    case GAME_SCORE: startPlayer1(); break;
+  }
+}
+
+void pollSwitch(unsigned long now) {
+  int value = digitalRead(SWITCH_PIN);
+  if (value != rawSwitch) {
+    rawSwitch = value;
+    rawSwitchChangeAt = now;
+  }
+  if (rawSwitch != stableSwitch &&
+      now - rawSwitchChangeAt >= SWITCH_DEBOUNCE_MS) {
+    stableSwitch = rawSwitch;
+    handleSwitchFlip();
+  }
+}
+
+void pollSerial() {
+  while (Serial.available() > 0) {
+    char command = (char)Serial.read();
+    if (command == 'n' || command == 'N') {
+      gameMode = GAME_READY;
+      originalCount = 0;
+      imitationCount = 0;
+      originalStarted = false;
+      imitationStarted = false;
+      finalScore = 0;
+      clearLights();
+      setNotice("NEW ROUND", "FLIP TO P1");
+      Serial.println(F("[TEST] Reset to READY; next flip starts Player 1."));
+    }
+  }
+}
+
+void connectWifi() {
+#if defined(SECRET_WIFIUSER) && defined(SECRET_WIFI_CA)
+  WiFi.beginEnterprise(WIFI_SSID, SECRET_WIFIUSER, WIFI_PASS,
+                       SECRET_WIFIUSER, SECRET_WIFI_CA);
+#elif defined(SECRET_WIFIUSER)
+  // Without a verified CA, enterprise credentials are not protected
+  // against an impostor authentication server. Ask university IT.
+  WiFi.beginEnterprise(WIFI_SSID, SECRET_WIFIUSER, WIFI_PASS);
+#else
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+#endif
+}
+
+void maintainNetwork(unsigned long now) {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (gameMode == GAME_DEMO) {
+      gameMode = GAME_P1_SAVED;
+      clearLights();
+      setNotice("WIFI LOST", "RETRY DEMO");
+      Serial.println(F("[DEMO] WiFi lost. Demonstration not completed."));
+    }
+    if (lastWifiAttempt == 0 || now - lastWifiAttempt >= 10000UL) {
+      lastWifiAttempt = now;
+      Serial.println(F("[WIFI] Connecting..."));
+      connectWifi();
+    }
+    return;
+  }
+  if (!mqttClient.connected()) {
+    if (gameMode == GAME_DEMO) {
+      gameMode = GAME_P1_SAVED;
+      clearLights();
+      setNotice("MQTT LOST", "RETRY DEMO");
+      Serial.println(F("[DEMO] MQTT lost. Demonstration not completed."));
+    }
+    if (lastMqttAttempt == 0 || now - lastMqttAttempt >= 5000UL) {
+      lastMqttAttempt = now;
+      Serial.println(F("[MQTT] Connecting..."));
+      if (mqttClient.connect(mqttClientId.c_str(), MQTT_USER, MQTT_PASS)) {
+        Serial.println(F("[MQTT] Connected, real 72-LED output is ready."));
+      } else {
+        Serial.print(F("[MQTT] Connection failed, state="));
+        Serial.println(mqttClient.state());
+      }
+    }
+    return;
+  }
+  mqttClient.loop();
+}
+
+bool beginOLED() {
+  const byte addresses[2] = {0x3C, 0x3D};
+  for (byte i = 0; i < 2; ++i) {
+    Wire.beginTransmission(addresses[i]);
+    if (Wire.endTransmission() != 0) continue;
+    if (oled.begin(SSD1306_SWITCHCAPVCC, addresses[i])) {
+      Serial.print(F("[OLED] Address=0x"));
+      Serial.println(addresses[i], HEX);
+      return true;
+    }
+  }
+  Serial.println(F("[OLED] Not found. Serial and lights remain available."));
+  return false;
+}
+
+void drawDrumIcon(unsigned long now) {
+  const int x = 98;
+  const int y = 36;
+  oled.drawRoundRect(x, y, 25, 18, 5, SSD1306_WHITE);
+  oled.drawLine(x + 2, y + 4, x + 23, y + 4, SSD1306_WHITE);
+  oled.drawLine(x + 4, y + 18, x + 2, y + 23, SSD1306_WHITE);
+  oled.drawLine(x + 21, y + 18, x + 23, y + 23, SSD1306_WHITE);
+  bool beat = ((now / 150UL) % 2UL) == 0UL;
+  oled.drawLine(x + 1, y - 16, x + 8, beat ? y + 3 : y - 5,
+                SSD1306_WHITE);
+  oled.drawLine(x + 24, y - 16, x + 17, beat ? y - 5 : y + 3,
+                SSD1306_WHITE);
+}
+
+void drawOLED(unsigned long now) {
+  if (!oledReady) return;
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.drawLine(91, 0, 91, 63, SSD1306_WHITE);
+
+  // The numeric score is intentionally NEVER masked by a notice.
+  if (gameMode == GAME_SCORE) {
+    oled.setCursor(0, 4);
+    oled.print(F("FINAL SCORE"));
+    oled.setTextSize(2);
+    oled.setCursor(0, 19);
+    oled.print(finalScore);
+    oled.setTextSize(1);
+    oled.print(F("/100"));
+    oled.setCursor(0, 47);
+    oled.print(F("P1:"));
+    oled.print(originalCount);
+    oled.print(F(" P2:"));
+    oled.print(imitationCount);
+  } else if (noticeActive && now - noticeStart < NOTICE_MS) {
+    oled.setCursor(0, 8);
+    oled.print(noticeLine1);
+    oled.setCursor(0, 26);
+    oled.print(noticeLine2);
+  } else {
+    oled.setCursor(0, 3);
+    switch (gameMode) {
+      case GAME_READY: oled.print(F("READY")); break;
+      case GAME_P1_RECORD: oled.print(F("P1 RECORD")); break;
+      case GAME_P1_SAVED: oled.print(F("P1 SAVED")); break;
+      case GAME_DEMO: oled.print(F("WATCH DEMO")); break;
+      case GAME_WAIT_P2: oled.print(F("P2 READY")); break;
+      case GAME_P2_RECORD: oled.print(F("P2 IMITATE")); break;
+      case GAME_SCORE: break;
+    }
+
+    oled.setCursor(0, 19);
+    oled.print(F("P1:"));
+    oled.print(originalCount);
+    oled.print(F(" P2:"));
+    oled.print(imitationCount);
+
+    oled.setCursor(0, 34);
+    if (gameMode == GAME_DEMO) {
+      oled.print(F("EVENT:"));
+      oled.print(demoIndex);
+    } else if (mostRecentDrum > 0) {
+      oled.print(F("DRUM "));
+      oled.print(mostRecentDrum);
+    } else {
+      oled.print(F("FLIP SWITCH"));
+    }
+
+    oled.setCursor(0, 50);
+    if (gameMode == GAME_P1_RECORD || gameMode == GAME_P2_RECORD) {
+      oled.print(F("STR: "));
+      oled.print(mostRecentStrength);
+    } else if (mqttClient.connected()) {
+      oled.print(F("MQTT: OK"));
+    } else {
+      oled.print(F("WAIT MQTT"));
+    }
+  }
+  drawDrumIcon(now);
+  oled.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+  unsigned long serialWait = millis();
+  while (!Serial && millis() - serialWait < 2500UL) {}
+
+  analogReadResolution(10);
+  pinMode(SWITCH_PIN, INPUT_PULLUP);
+  rawSwitch = digitalRead(SWITCH_PIN);
+  stableSwitch = rawSwitch;
+
+  Serial.println(F("=========================================="));
+  Serial.println(F("TEST 07 — TWO-PLAYER RHYTHM IMITATION GAME"));
+  Serial.println(F("A0/A1/A2, D2 latching switch, OLED, 72 LED MQTT"));
+  Serial.println(F("Keep ALL drums quiet during calibration."));
+
+  for (byte drum = 0; drum < DRUM_COUNT; ++drum) {
+    pinMode(PIEZO_PINS[drum], INPUT);
+    long sum = 0;
+    for (int sample = 0; sample < 100; ++sample) {
+      sum += analogRead(PIEZO_PINS[drum]);
+      delay(2);
+    }
+    baseline[drum] = sum / 100.0f;
+  }
+
+  Wire.begin();
+  Wire.setClock(400000UL);
+  oledReady = beginOLED();
+
+  byte mac[6] = {0};
+  WiFi.macAddress(mac);
+  char suffix[13];
+  snprintf(suffix, sizeof(suffix), "%02X%02X%02X%02X%02X%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  mqttClientId = String("CASA0014_Test07_") + suffix;
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  if (!mqttClient.setBufferSize(512)) {
+    Serial.println(F("[ERROR] Cannot allocate MQTT 512-byte buffer."));
+  }
+  mqttClient.setKeepAlive(30);
+  mqttClient.setSocketTimeout(2);
+
+  clearLights();
+  setNotice("READY", "WAIT MQTT");
+  Serial.println(F("Wait for MQTT Connected before starting Player 1."));
+  Serial.println(F("Switch: P1 REC -> P1 SAVE -> DEMO -> P2 REC -> SCORE -> NEW ROUND"));
+  Serial.println(F("Serial: 'n' resets the game (test convenience only)."));
+}
+
+void loop() {
+  unsigned long now = millis();
+  readRealDrums(now);
+  pollSwitch(now);
+  pollSerial();
+  maintainNetwork(now);
+  updateDemo(now);
+
+  if (now - lastLightFrame >= LIGHT_FRAME_MS) {
+    lastLightFrame = now;
+    if (mqttClient.connected()) {
+      renderLights(now);
+      if (!mqttClient.publish(LIGHT_TOPIC, rgbPayload, PAYLOAD_SIZE)) {
+        Serial.println(F("[MQTT] Lighting publish failed."));
+        if (gameMode == GAME_DEMO) {
+          gameMode = GAME_P1_SAVED;
+          clearLights();
+          setNotice("SEND FAILED", "RETRY DEMO");
+          Serial.println(F("[DEMO] Not completed: light publish failed."));
+        }
+      }
+    }
+  }
+
+  if (now - lastOledFrame >= OLED_FRAME_MS) {
+    lastOledFrame = now;
+    drawOLED(now);
+  }
+}
