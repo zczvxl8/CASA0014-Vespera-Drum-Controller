@@ -130,11 +130,11 @@ const int drumPins[drumCount] = {
 };
 
 int hitThreshold[drumCount] = {
-  30, 20, 30
+  20, 20, 20
 };
 
 int releaseThreshold[drumCount] = {
-  20, 20, 20
+  30, 30, 30
 };
 
 const unsigned long cooldown = 30;
@@ -173,11 +173,11 @@ byte RGBpayload[payload_size];
 
 const byte idlePalette[3][3] = {
 
-  { 4, 28, 23 },  // Drum 1：深薄荷绿
+  { 4, 28, 23 }, 
 
-  { 25, 6, 29 },  // Drum 2：深紫色
+  { 25, 6, 29 },  
 
-  { 30, 12, 3 }   // Drum 3：暖琥珀色
+  { 30, 12, 3 }  
 };
 
 
@@ -197,27 +197,27 @@ const unsigned long levelFadeMs[5] = {
 const byte drumPalette[3][5][3] = {
 
   {
-    { 70, 235, 205 },  // 极轻：薄荷绿
-    { 5, 210, 205 },   // 轻敲：青绿色
-    { 5, 165, 240 },   // 中敲：湖蓝色
-    { 60, 110, 250 },  // 较重：电光蓝
-    { 125, 75, 245 }   // 重敲：紫罗兰
+    { 70, 235, 205 },
+    { 5, 210, 205 },
+    { 5, 165, 240 },
+    { 60, 110, 250 },
+    { 125, 75, 245 }
   },
 
   {
-    { 205, 165, 250 },  // 极轻：薰衣草紫
-    { 220, 110, 245 },  // 轻敲：淡紫
-    { 250, 70, 215 },   // 中敲：霓虹粉紫
-    { 250, 55, 160 },   // 较重：玫瑰粉
-    { 225, 35, 115 }    // 重敲：莓果红
+    { 205, 165, 250 },
+    { 220, 110, 245 },
+    { 250, 70, 215 },
+    { 250, 55, 160 },
+    { 225, 35, 115 }
   },
 
   {
-    { 255, 205, 105 },  // 极轻：香槟金
-    { 255, 170, 70 },   // 轻敲：暖橙
-    { 255, 130, 65 },   // 中敲：日落橙
-    { 250, 95, 90 },    // 较重：珊瑚红
-    { 230, 65, 105 }    // 重敲：珊瑚玫红
+    { 255, 205, 105 },
+    { 255, 170, 70 },
+    { 255, 130, 65 },
+    { 250, 95, 90 },
+    { 230, 65, 105 }
   }
 };
 
@@ -563,13 +563,9 @@ void drawMiniDrum(int x, int y, bool hit) {
     x + 22, y + 31,
     SSD1306_WHITE);
 
-  // ==================================
-  // 两个动画画面
-  // ==================================
-
+  
   if (hit) {
 
-    // 画面1：鼓槌敲下来
     oled.drawLine(
       x + 5, y + 5,
       x + 14, y + 14,
@@ -580,7 +576,6 @@ void drawMiniDrum(int x, int y, bool hit) {
       x + 15, y + 14,
       SSD1306_WHITE);
 
-    // 敲击效果
     oled.drawPixel(
       x + 1, y + 13,
       SSD1306_WHITE);
@@ -591,7 +586,6 @@ void drawMiniDrum(int x, int y, bool hit) {
 
   } else {
 
-    // 画面2：鼓槌抬起来
     oled.drawLine(
       x, y,
       x + 11, y + 10,
@@ -619,17 +613,14 @@ void drawOLEDStartScreen() {
   oled.setTextSize(1);
   oled.setTextColor(SSD1306_WHITE);
 
-  // 上方标题
   oled.setCursor(28, 3);
   oled.println("RHYTHM LIGHT");
 
-  // 中间动态小鼓
   drawMiniDrum(
     50,
     19,
     drumStickDown);
 
-  // 下方提示
   oled.setCursor(22, 55);
   oled.println("READY TO PLAY");
 
