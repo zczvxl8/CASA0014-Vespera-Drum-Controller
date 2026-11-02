@@ -42,6 +42,17 @@ The piezo discs are mounted beneath the cardboard playing surfaces. How they are
 
 The project started with **one piezo sensor and a basic light response**. I expanded it to three pads, then adjusted the colour palettes, sensitivity, fade duration and behaviour when multiple drums are played together. I later added the buzzer, OLED and external switch, followed by recording/replay and imitation-scoring experiments. The Git commit history documents these iterations.
 
+## Demonstration Videos
+### 1. Two-Player Imitation Game ▶️
+
+This video demonstrates the rhythm recording, imitation game and scoring process through the Luminarie interface.
+[https://youtube.com/shorts/tNUndWF82gs?feature=share]
+
+### 2. Physical Drum and MQTT Lighting ▶️
+
+This video demonstrates the physical drum controlling RGB lighting through MQTT. Different drum hits produce changes in the lighting response.
+[https://youtube.com/shorts/MPeVh-dzvPs]
+
 ## Testing & Evaluation
 
 The [Test/](Test/) folder contains separate sketches for piezo signals, hit detection, MQTT lighting, buzzer, OLED, recording and imitation scoring.
@@ -77,6 +88,6 @@ The [Test/](Test/) folder contains separate sketches for piezo signals, hit dete
 | [firmware/vespera_drum_controller/](firmware/vespera_drum_controller/) | Main Arduino program and secrets template |
 | [Test/](Test/) | Individual hardware and interaction test sketches |
 | [Diagram/](Diagram/) | Concept, circuit, wiring and final prototype images |
-
+| [Demo/](Demo/) | Prototype demonstration and functionality testing videos |
 ---
 
