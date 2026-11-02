@@ -46,12 +46,12 @@ The project started with **one piezo sensor and a basic light response**. I expa
 ### 1. Two-Player Imitation Game ▶️
 
 This video demonstrates the rhythm recording, imitation game and scoring process through the Luminarie interface.
-[https://youtube.com/shorts/tNUndWF82gs?feature=share]
+[▶ Watch Two-Player Game Demo](https://youtube.com/shorts/tNUndWF82gs?feature=share)
 
 ### 2. Physical Drum and MQTT Lighting ▶️
 
 This video demonstrates the physical drum controlling RGB lighting through MQTT. Different drum hits produce changes in the lighting response.
-[https://youtube.com/shorts/MPeVh-dzvPs]
+[▶ Watch Physical Lighting Demo](https://youtube.com/shorts/MPeVh-dzvPs)
 
 ## Testing & Evaluation
 
@@ -66,13 +66,9 @@ The [Test/](Test/) folder contains separate sketches for piezo signals, hit dete
 | **Recording and replay** | Event timing and replay were implemented in test code, but need further checks on the finished drum. |
 | **Imitation scoring** | Sample-sequence checks gave **100** for three matching hits and **67** with one missing or incorrect hit. This is a logic test, not a full two-player playtest. |
 
-## Reflection & Future Work
+## Future Work
 
-**What worked:** The three-pad interaction makes the lights feel connected to physical rhythm. Mixing colours for combined hits was especially interesting.
-
-**What was difficult:** Sensitivity varied between the pads, and loose jumper connections or vibrations sometimes caused missed or false triggers. The passive buzzer provides feedback but does not sound like a real drum.
-
-**Next steps:** Improve sensor mounting and replace connections with locking connectors; tune thresholds through repeated tests; try a small speaker and audio playback module; and add microSD storage so recordings survive power-off. I would also try to add more funtions to make it more intertsting.
+I would like to improve the sensor mounting and use more secure connections to make hit detection more reliable. I also plan to try a small speaker and audio module for better drum sounds, and add microSD storage to save recordings. In the future, I would like to explore more interactive features and different ways for two people to play together.
 
 ## Getting started
 
@@ -81,7 +77,7 @@ The [Test/](Test/) folder contains separate sketches for piezo signals, hit dete
 3. Copy the provided secrets template to a file named arduino_secrets.h in the same sketch folder. Add your own network and MQTT settings. **Never commit real credentials.**
 4. Connect the sensors and other components according to the wiring diagrams, then upload the sketch. The RGB LEDs are controlled remotely through the Vespera/MQTT setup, **not directly from the Arduino pins**.
 
-### Repository structure
+## Repository structure
 
 | Location | Contents |
 | --- | --- |
@@ -89,5 +85,11 @@ The [Test/](Test/) folder contains separate sketches for piezo signals, hit dete
 | [Test/](Test/) | Individual hardware and interaction test sketches |
 | [Diagram/](Diagram/) | Concept, circuit, wiring and final prototype images |
 | [Demo/](Demo/) | Prototype demonstration and functionality testing videos |
+
+
+## AI Usage Statement
+
+I used ChatGPT as a reference during the development and testing process. It helped me explore testing approaches, understand compilation errors and review example code. I adapted the suggestions to my hardware setup and tested the results on the physical prototype. The final adjustments and evaluation were based on my own observations.
+
 ---
 
